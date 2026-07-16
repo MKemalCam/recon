@@ -72,6 +72,7 @@ cat "$OUTPUT_DIR/subfinder_results" | dnsx -a -resp-only > "$OUTPUT_DIR/resolved
 #masscan
 echo "[cammk] masscan taramasi yapiliyor..."
 sudo masscan -iL "$OUTPUT_DIR/resolved_ips" -p1-65535 --rate 1000 -oL "$OUTPUT_DIR/masscan_raw"
+#naabu
 echo "[cammk] naabu baslatiliyor..."
 cat "$OUTPUT_DIR/masscan_raw" | grep "open" | awk '{print $4":"$3}' > "$OUTPUT_DIR/devOnly_sorted_masscan"
 cat "$OUTPUT_DIR/masscan_raw" | grep "open" | awk '{print $4":"$3}' | naabu -ss > "$OUTPUT_DIR/verified_ports"
