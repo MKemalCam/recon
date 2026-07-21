@@ -3,7 +3,7 @@
 #-u flag yokken cikis, o pipefail grep no result icin koruma
 set -uo pipefail
 
-#adim atlama flaglari (--skip-<adim> ile acilir, bkz. show_usage)
+#adim atlama flaglari
 SKIP_KEYS=false
 SKIP_SUBFINDER=false
 SKIP_GAU=false
@@ -21,6 +21,11 @@ TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORDLIST="$SCRIPT_DIR/subdomain_wordlist.txt"
 
+#Kaan hocanin port listesi
+COMMON_HTTP_PORTS="80,81,300,443,591,593,832,981,1010,1311,1099,2082,2095,2096,2480,3000,3128,3333,4243,4443,4444,4567,4711,4712,4993,5000,5104,5108,5280,5281,5601,5800,6543,7000,7001,7396,7474,8000,8001,8008,8014,8042,8060,8069,8080,8081,8083,8088,8090,8091,8095,8118,8123,8172,8181,8222,8243,8280,8281,8333,8337,8443,8444,8500,8800,8834,8880,8881,8888,8983,9000,9001,9043,9060,9080,9090,9091,9200,9443,9502,9800,9981,10000,10250,11371,12443,15672,16080,17778,18091,18092,20720,27201,32000,55440,55672"
+
+NAABU_PORTS=common
+
 show_usage(){
 	cat << EOF
 Kullanim: $0 (-d <domain> | <domain>) [--skip-<adim> ...]
@@ -28,11 +33,13 @@ Kullanim: $0 (-d <domain> | <domain>) [--skip-<adim> ...]
 Argumanlar:
   -d <domain>          Taranacak hedef domain (pozisyonel de olur: $0 hedef.com)
   -h, --help           Bu yardimi goster
+  --naabu-ports <m>    naabu port kapsami: common (varsayilan) | all
+                       common = ortak HTTP/panel portlari, all = 1-65535
 
-Adim atlama flaglari (test icin):
-  --skip-keys          api key setup (interaktif)
+Adim atlama flaglari:
+  --skip-keys          api key setup
   --skip-subfinder     pasif subdomain enum
-  --skip-gau           pasif endpoint (YAVAS)
+  --skip-gau           pasif endpoint
   --skip-api-sort      api/swagger endpoint filtreleme
   --skip-github        metabigor github arama
   --skip-brute         dnsx subdomain bruteforce
@@ -56,6 +63,9 @@ parse_args(){
 			-d)
 				if [[ -n "${2:-}" ]]; then TARGET="$2"; shift 2
 				else echo "[!] -d bir domain argumani ister"; exit 1; fi ;;
+			--naabu-ports)
+				if [[ "${2:-}" =~ ^(common|all)$ ]]; then NAABU_PORTS="$2"; shift 2
+				else echo "[!] --naabu-ports sadece 'common' veya 'all' kabul eder"; exit 1; fi ;;
 			--skip-keys)        SKIP_KEYS=true;        shift ;;
 			--skip-subfinder)   SKIP_SUBFINDER=true;   shift ;;
 			--skip-gau)         SKIP_GAU=true;         shift ;;
@@ -196,7 +206,7 @@ run_github(){
 		# trufflehog github --repo ...   (placeholder: repo dongusu doldurulacak)
 	else
 		echo "[cammk] domaine bagli github reposu bulunamadi"
-		rm -f "$OUTPUT_DIR/github_results"   # FIX: -f, dosya olmayabilir
+		rm -f "$OUTPUT_DIR/github_results"
 	fi
 }
 
@@ -219,11 +229,9 @@ run_brute(){
 	cat "$OUTPUT_DIR/subfinder_results" "$OUTPUT_DIR/dnsx_brute_results" 2>/dev/null | sort -u > "$OUTPUT_DIR/subdomains_list"
 }
 
-#live subdomain probe httpx-toolkit
+#live subdomain probe httpx-toolkit (global COMMON_HTTP_PORTS)
 run_httpx_probe(){
 	echo "[cammk] canli subdomain testi (httpx)..."
-	#Kaan hocanin portlari
-	local COMMON_HTTP_PORTS="80,81,300,443,591,593,832,981,1010,1311,1099,2082,2095,2096,2480,3000,3128,3333,4243,4443,4444,4567,4711,4712,4993,5000,5104,5108,5280,5281,5601,5800,6543,7000,7001,7396,7474,8000,8001,8008,8014,8042,8060,8069,8080,8081,8083,8088,8090,8091,8095,8118,8123,8172,8181,8222,8243,8280,8281,8333,8337,8443,8444,8500,8800,8834,8880,8881,8888,8983,9000,9001,9043,9060,9080,9090,9091,9200,9443,9502,9800,9981,10000,10250,11371,12443,15672,16080,17778,18091,18092,20720,27201,32000,55440,55672"
 	httpx-toolkit -l "$OUTPUT_DIR/subdomains_list" -ports "$COMMON_HTTP_PORTS" -o "$OUTPUT_DIR/live_subdomains"
 	[ -s "$OUTPUT_DIR/live_subdomains" ] || echo "[!] canli subdomain bulunamadi."
 }
@@ -263,31 +271,30 @@ run_resolve(){
 	[ -s "$OUTPUT_DIR/resolved_ips" ] || echo "[!] ip resolve edilemedi, masscan/naabu bos donebilir."
 }
 
-#masscan full port scan (tepeye flag eklenecek, belli portlara limitlemek icin)
-#--retries 3: tek SYN dusunce port kacmasin (masscan default'ta tekrar atmaz)
+#masscan full port scan
 run_masscan(){
 	echo "[cammk] masscan taramasi yapiliyor..."
 	sudo masscan -iL "$OUTPUT_DIR/resolved_ips" -p1-65535 --rate 1000 --retries 3 -oL "$OUTPUT_DIR/masscan_raw"
 }
 
-#verified_ports = masscan + naabu + httpx birlesimi (union).
-#Hicbir aracin flaky olmasi digerlerinin buldugunu sifirlamasin; httpx'in
-#zaten dogruladigi HTTP portlari her zaman taban olur.
+#verified_ports = masscan + naabu + httpx birlesimi
 run_naabu(){
 	: > "$OUTPUT_DIR/verified_ports"
 
-	# 1) masscan'in bulduklari (ip:port) - dogrudan korunur, atilmaz
+	# 1) masscan'in bulduklari (ip:port)
 	if [ -s "$OUTPUT_DIR/masscan_raw" ]; then
 		grep "open" "$OUTPUT_DIR/masscan_raw" | awk '{print $4":"$3}' >> "$OUTPUT_DIR/verified_ports" || true
 	fi
 
-	# 2) naabu connect scan - masscan'in kacirdigi ekstra portlar icin
+	# 2) naabu connect scan 
 	if [ -s "$OUTPUT_DIR/resolved_ips" ]; then
-		naabu -l "$OUTPUT_DIR/resolved_ips" -s c -silent >> "$OUTPUT_DIR/verified_ports" 2>/dev/null || true
-		echo "[cammk] naabu tamamlandi."
+		local naabu_ports
+		[ "$NAABU_PORTS" = all ] && naabu_ports="-" || naabu_ports="$COMMON_HTTP_PORTS"
+		naabu -l "$OUTPUT_DIR/resolved_ips" -p "$naabu_ports" -s c -silent >> "$OUTPUT_DIR/verified_ports" 2>/dev/null || true
+		echo "[cammk] naabu tamamlandi (kapsam: $NAABU_PORTS)."
 	fi
 
-	# 3) httpx'in zaten dogruladigi HTTP portlari (taban - asla bos kalmasin)
+	# 3) httpx'in zaten dogruladigi HTTP portlari
 	#    live_subdomains: http://h -> h:80, https://h -> h:443, http://h:8080 -> h:8080
 	if [ -s "$OUTPUT_DIR/live_subdomains" ]; then
 		awk -F/ '
