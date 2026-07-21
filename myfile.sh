@@ -174,7 +174,7 @@ fi
 
 #dnsx (ACTIVE: DNS cozumleme)
 echo "[cammk] ipler resolvelaniyor..."
-cat "$OUTPUT_DIR/subdomains_list" | dnsx -a -resp-only > "$OUTPUT_DIR/resolved_ips"
+cat "$OUTPUT_DIR/subdomains_list" | dnsx -a -resp-only | sort -u > "$OUTPUT_DIR/resolved_ips"
 [ -s "$OUTPUT_DIR/resolved_ips" ] || echo "[!] ip resolve edilemedi, masscan/naabu bos donebilir."
 
 #masscan full port scan (tepeye flag eklenecek, belli portlara limitlemek icin)
@@ -184,9 +184,9 @@ sudo masscan -iL "$OUTPUT_DIR/resolved_ips" -p1-65535 --rate 1000 -oL "$OUTPUT_D
 #naabu + masscan bos donerse fallback
 if [ ! -s "$OUTPUT_DIR/masscan_raw" ]; then
 	echo "[cammk] masscan donus yapmadi, naabu fallback deneniyor..."
-	sudo naabu -l "$OUTPUT_DIR/resolved_ips" -ss -o "$OUTPUT_DIR/verified_ports"
+	naabu -l "$OUTPUT_DIR/resolved_ips" -s c -o "$OUTPUT_DIR/verified_ports"
 else
-	cat "$OUTPUT_DIR/masscan_raw" | grep "open" | awk '{print $4":"$3}' | sudo naabu -ss -o "$OUTPUT_DIR/verified_ports"
+	grep "open" "$OUTPUT_DIR/masscan_raw" | awk '{print $4}' | sort -u | naabu -s c -o "$OUTPUT_DIR/verified_ports"
 	echo "[cammk] naabu tamamlandi."
 fi
 
