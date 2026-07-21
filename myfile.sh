@@ -264,20 +264,40 @@ run_resolve(){
 }
 
 #masscan full port scan (tepeye flag eklenecek, belli portlara limitlemek icin)
+#--retries 3: tek SYN dusunce port kacmasin (masscan default'ta tekrar atmaz)
 run_masscan(){
 	echo "[cammk] masscan taramasi yapiliyor..."
-	sudo masscan -iL "$OUTPUT_DIR/resolved_ips" -p1-65535 --rate 1000 -oL "$OUTPUT_DIR/masscan_raw"
+	sudo masscan -iL "$OUTPUT_DIR/resolved_ips" -p1-65535 --rate 1000 --retries 3 -oL "$OUTPUT_DIR/masscan_raw"
 }
 
-#naabu + masscan bos donerse fallback
+#verified_ports = masscan + naabu + httpx birlesimi (union).
+#Hicbir aracin flaky olmasi digerlerinin buldugunu sifirlamasin; httpx'in
+#zaten dogruladigi HTTP portlari her zaman taban olur.
 run_naabu(){
-	if [ ! -s "$OUTPUT_DIR/masscan_raw" ]; then
-		echo "[cammk] masscan donus yapmadi, naabu fallback deneniyor..."
-		naabu -l "$OUTPUT_DIR/resolved_ips" -s c -o "$OUTPUT_DIR/verified_ports"
-	else
-		grep "open" "$OUTPUT_DIR/masscan_raw" | awk '{print $4}' | sort -u | naabu -s c -o "$OUTPUT_DIR/verified_ports"
+	: > "$OUTPUT_DIR/verified_ports"
+
+	# 1) masscan'in bulduklari (ip:port) - dogrudan korunur, atilmaz
+	if [ -s "$OUTPUT_DIR/masscan_raw" ]; then
+		grep "open" "$OUTPUT_DIR/masscan_raw" | awk '{print $4":"$3}' >> "$OUTPUT_DIR/verified_ports" || true
+	fi
+
+	# 2) naabu connect scan - masscan'in kacirdigi ekstra portlar icin
+	if [ -s "$OUTPUT_DIR/resolved_ips" ]; then
+		naabu -l "$OUTPUT_DIR/resolved_ips" -s c -silent >> "$OUTPUT_DIR/verified_ports" 2>/dev/null || true
 		echo "[cammk] naabu tamamlandi."
 	fi
+
+	# 3) httpx'in zaten dogruladigi HTTP portlari (taban - asla bos kalmasin)
+	#    live_subdomains: http://h -> h:80, https://h -> h:443, http://h:8080 -> h:8080
+	if [ -s "$OUTPUT_DIR/live_subdomains" ]; then
+		awk -F/ '
+			/^https:\/\// { hp=$3; print (hp ~ /:/) ? hp : hp":443" }
+			/^http:\/\//  { hp=$3; print (hp ~ /:/) ? hp : hp":80"  }
+		' "$OUTPUT_DIR/live_subdomains" >> "$OUTPUT_DIR/verified_ports" || true
+	fi
+
+	sort -u "$OUTPUT_DIR/verified_ports" -o "$OUTPUT_DIR/verified_ports"
+	[ -s "$OUTPUT_DIR/verified_ports" ] && echo "[cammk] $(wc -l < "$OUTPUT_DIR/verified_ports") host:port toplandi (masscan+naabu+httpx)."
 }
 
 run_nmap(){
