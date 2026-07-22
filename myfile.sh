@@ -143,8 +143,8 @@ api_key_setup(){
         fi
     fi
 
-    echo "İstenilen api keyleri giriniz."
-    echo "Boş bırakılması durumunda bu keyin servisi kullanılmayacaktır."
+    echo "Istenilen api keyleri giriniz."
+    echo "Bos birakilmasi durumunda bu keylerin servisleri kullanilamayacaktir."
 
     read -s -p "Shodan API key: "     shodan_key; echo
     read -s -p "VirusTotal API key: " vt_key;     echo
