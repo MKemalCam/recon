@@ -16,6 +16,9 @@ SKIP_RESOLVE=false
 SKIP_MASSCAN=false
 SKIP_NAABU=false
 SKIP_NMAP=false
+SKIP_WHATWEB=false
+SKIP_KATANA=false
+SKIP_KATANA_JS=false
 
 TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,6 +52,9 @@ Adim atlama flaglari:
   --skip-masscan       masscan port tarama
   --skip-naabu         naabu connect scan
   --skip-nmap          nmap + httpx banner grab
+  --skip-whatweb       whatweb teknoloji/surum tespiti
+  --skip-katana        katana crawl
+  --skip-katana-js     katana js dosyalarini indir + trufflehog
 
 Ornek:
   $0 -d testfire.net --skip-gau --skip-github
@@ -78,6 +84,9 @@ parse_args(){
 			--skip-masscan)     SKIP_MASSCAN=true;     shift ;;
 			--skip-naabu)       SKIP_NAABU=true;       shift ;;
 			--skip-nmap)        SKIP_NMAP=true;        shift ;;
+			--skip-whatweb)     SKIP_WHATWEB=true;     shift ;;
+			--skip-katana)      SKIP_KATANA=true;      shift ;;
+			--skip-katana-js)   SKIP_KATANA_JS=true;   shift ;;
 			*)
 				if [[ -z "$TARGET" ]]; then TARGET="$1"; shift
 				else echo "[!] Bilinmeyen arguman: $1"; show_usage; exit 1; fi ;;
@@ -107,7 +116,7 @@ setup_output(){
 
 check_deps(){
 	local missing=0
-	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog metabigor; do
+	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog metabigor whatweb katana; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "[!] eksik arac: $tool"
 			missing=1
@@ -320,6 +329,61 @@ run_nmap(){
 	fi
 }
 
+#whatweb ile canli hostlarda framework/surum tespiti
+run_whatweb(){
+	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
+		echo "[cammk] canli host yok, whatweb atlaniyor."
+		return 0
+	fi
+	echo "[cammk] whatweb ile teknoloji tespiti yapiliyor..."
+	whatweb -i "$OUTPUT_DIR/live_subdomains" -a 3 -t 25 --no-errors \
+		--log-brief="$OUTPUT_DIR/whatweb_brief.txt" \
+		--log-json="$OUTPUT_DIR/whatweb.json"
+	echo "[cammk] whatweb tamamlandi. ozet: whatweb_brief.txt, json: whatweb.json"
+}
+
+#katana crawl
+run_katana(){
+	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
+		echo "[cammk] canli host yok, katana atlaniyor."
+		return 0
+	fi
+	echo "[cammk] katana ile crawl yapiliyor..."
+	katana -list "$OUTPUT_DIR/live_subdomains" -jc -kf all -d 3 -c 10 -rl 150 -silent -o "$OUTPUT_DIR/katana_urls"
+	[ -s "$OUTPUT_DIR/katana_urls" ] && echo "[cammk] katana tamamlandi. $(wc -l < "$OUTPUT_DIR/katana_urls") url katana_urls dosyasina kaydedildi." || echo "[!] katana url uretmedi."
+}
+
+#katana js filter + trufflehog
+run_katana_js(){
+	if [ ! -s "$OUTPUT_DIR/katana_urls" ]; then
+		echo "[cammk] katana_urls yok, js secret taramasi atlaniyor."
+		return 0
+	fi
+	grep -iE '\.js($|\?)' "$OUTPUT_DIR/katana_urls" | sort -u > "$OUTPUT_DIR/katana_js_urls" || true
+	if [ ! -s "$OUTPUT_DIR/katana_js_urls" ]; then
+		echo "[cammk] js dosyasi bulunamadi, trufflehog atlaniyor."
+		rm -f "$OUTPUT_DIR/katana_js_urls"
+		return 0
+	fi
+	echo "[cammk] $(wc -l < "$OUTPUT_DIR/katana_js_urls") js dosyasi indiriliyor..."
+	mkdir -p "$OUTPUT_DIR/katana_js_responses"
+	cat "$OUTPUT_DIR/katana_js_urls" | httpx-toolkit -silent -rl 5 -t 2 -random-agent -sr -srd "$OUTPUT_DIR/katana_js_responses"
+
+	if [ -d "$OUTPUT_DIR/katana_js_responses" ] && [ -n "$(ls -A "$OUTPUT_DIR/katana_js_responses" 2>/dev/null)" ]; then
+		echo "[cammk] js dosyalarinda secret aramalari yapilacak. trufflehog baslatiliyor..."
+		trufflehog filesystem "$OUTPUT_DIR/katana_js_responses" --no-update > "$OUTPUT_DIR/thog_katana_js"
+		[ ! -s "$OUTPUT_DIR/thog_katana_js" ] && rm -f "$OUTPUT_DIR/thog_katana_js"
+	else
+		echo "[cammk] indirilmis js yaniti yok, trufflehog atlaniyor."
+	fi
+
+	if [ -f "$OUTPUT_DIR/thog_katana_js" ]; then
+		echo "[cammk] js dosyalarinda key/secret bulundu. $OUTPUT_DIR icerisinde kontrol ediniz."
+	else
+		echo "[cammk] js dosyalarinda key/secret bulunamadi."
+	fi
+}
+
 
 #pipeline: her adim SKIP_* bayragina gore calisir
 run_step(){
@@ -349,6 +413,9 @@ main(){
 	run_step SKIP_MASSCAN     run_masscan
 	run_step SKIP_NAABU       run_naabu
 	run_step SKIP_NMAP        run_nmap
+	run_step SKIP_WHATWEB     run_whatweb
+	run_step SKIP_KATANA      run_katana
+	run_step SKIP_KATANA_JS   run_katana_js
 
 	echo "[cammk] pipeline tamamlandi."
 }
