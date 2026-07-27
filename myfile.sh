@@ -8,6 +8,7 @@ SKIP_KEYS=false
 SKIP_SUBFINDER=false
 SKIP_GAU=false
 SKIP_API_SORT=false
+SKIP_SWAGGER_POSTMAN=false
 SKIP_GITHUB=false
 SKIP_BRUTE=false
 SKIP_HTTPX_PROBE=false
@@ -19,10 +20,13 @@ SKIP_NMAP=false
 SKIP_WHATWEB=false
 SKIP_KATANA=false
 SKIP_KATANA_JS=false
+SKIP_FUZZ=false
+SKIP_DEDUPE=false
 
 TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORDLIST="$SCRIPT_DIR/subdomain_wordlist.txt"
+FUZZ_WORDLIST="$SCRIPT_DIR/fuzz_wordlist.txt"
 
 #Kaan hocanin port listesi
 COMMON_HTTP_PORTS="80,81,300,443,591,593,832,981,1010,1311,1099,2082,2095,2096,2480,3000,3128,3333,4243,4443,4444,4567,4711,4712,4993,5000,5104,5108,5280,5281,5601,5800,6543,7000,7001,7396,7474,8000,8001,8008,8014,8042,8060,8069,8080,8081,8083,8088,8090,8091,8095,8118,8123,8172,8181,8222,8243,8280,8281,8333,8337,8443,8444,8500,8800,8834,8880,8881,8888,8983,9000,9001,9043,9060,9080,9090,9091,9200,9443,9502,9800,9981,10000,10250,11371,12443,15672,16080,17778,18091,18092,20720,27201,32000,55440,55672"
@@ -44,7 +48,8 @@ Adim atlama flaglari:
   --skip-subfinder     pasif subdomain enum
   --skip-gau           pasif endpoint
   --skip-api-sort      api/swagger endpoint filtreleme
-  --skip-github        metabigor github arama
+  --skip-swagger-postman  online swagger/postman leak arama (swaggerhub + postman)
+  --skip-github        github code search repo secret arama
   --skip-brute         dnsx subdomain bruteforce
   --skip-httpx-probe   canli subdomain probe
   --skip-api-secrets   api icerik indir + trufflehog
@@ -55,6 +60,8 @@ Adim atlama flaglari:
   --skip-whatweb       whatweb teknoloji/surum tespiti
   --skip-katana        katana crawl
   --skip-katana-js     katana js dosyalarini indir + trufflehog
+  --skip-fuzz          ffuf ile dizin/dosya fuzzing
+  --skip-dedupe        tum url'leri birlestir + httpx 404/fp ayikla
 
 Ornek:
   $0 -d testfire.net --skip-gau --skip-github
@@ -76,6 +83,7 @@ parse_args(){
 			--skip-subfinder)   SKIP_SUBFINDER=true;   shift ;;
 			--skip-gau)         SKIP_GAU=true;         shift ;;
 			--skip-api-sort)    SKIP_API_SORT=true;    shift ;;
+			--skip-swagger-postman) SKIP_SWAGGER_POSTMAN=true; shift ;;
 			--skip-github)      SKIP_GITHUB=true;      shift ;;
 			--skip-brute)       SKIP_BRUTE=true;       shift ;;
 			--skip-httpx-probe) SKIP_HTTPX_PROBE=true; shift ;;
@@ -87,6 +95,8 @@ parse_args(){
 			--skip-whatweb)     SKIP_WHATWEB=true;     shift ;;
 			--skip-katana)      SKIP_KATANA=true;      shift ;;
 			--skip-katana-js)   SKIP_KATANA_JS=true;   shift ;;
+			--skip-fuzz)        SKIP_FUZZ=true;        shift ;;
+			--skip-dedupe)      SKIP_DEDUPE=true;      shift ;;
 			*)
 				if [[ -z "$TARGET" ]]; then TARGET="$1"; shift
 				else echo "[!] Bilinmeyen arguman: $1"; show_usage; exit 1; fi ;;
@@ -116,7 +126,7 @@ setup_output(){
 
 check_deps(){
 	local missing=0
-	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog metabigor whatweb katana; do
+	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog whatweb katana ffuf curl jq; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "[!] eksik arac: $tool"
 			missing=1
@@ -130,7 +140,7 @@ check_deps(){
 ###          PASSIVE RECON               ###
 ############################################
 # hedefe dogrudan istek atmayan adimlar
-# subfinder (pasif kaynaklar), gau (wayback/otx/commoncrawl), github/osint.
+# subfinder (pasif kaynaklar), gau (wayback/otx/commoncrawl), github/postman/swagger osint.
 
 api_key_setup(){
     local config_file="$OUTPUT_DIR/keys.yaml"
@@ -143,8 +153,8 @@ api_key_setup(){
         fi
     fi
 
-    echo "Istenilen api keyleri giriniz."
-    echo "Bos birakilmasi durumunda bu keylerin servisleri kullanilamayacaktir."
+    echo "İstenilen api keyleri giriniz."
+    echo "Boş bırakılması durumunda bu keyin servisi kullanılmayacaktır."
 
     read -s -p "Shodan API key: "     shodan_key; echo
     read -s -p "VirusTotal API key: " vt_key;     echo
@@ -206,16 +216,114 @@ run_api_sort(){
 	grep -iE "api|swagger|docs|postman|graphql|wadl" "$OUTPUT_DIR/gau_filtered" > "$OUTPUT_DIR/api_endpoints" || true
 }
 
-#Trufflehog GitHub scan (passive: repo/commit gecmisi)
-run_github(){
-	echo "[cammk] domain ismini iceren github repolari taraniyor..."
-	echo "$TARGET" | metabigor github -o "$OUTPUT_DIR/github_results"
-	if [ -s "$OUTPUT_DIR/github_results" ]; then
-		echo "[cammk] github repolari bulundu."
-		# trufflehog github --repo ...   (placeholder: repo dongusu doldurulacak)
+#url listesini indir (httpx) + trufflehog ile secret tara.
+sp_secret_scan(){
+	local urls="$1" label="$2"
+	[ -s "$urls" ] || return 0
+	local respdir="$OUTPUT_DIR/${label}_responses"
+	mkdir -p "$respdir"
+	echo "[cammk] $label icerikleri indiriliyor..."
+	# sadece cozulmus http(s) url'ler indirilir ({{baseUrl}} kalanlar atlanir)
+	grep -iE '^https?://' "$urls" | httpx-toolkit -silent -rl 5 -t 2 -random-agent -sr -srd "$respdir" || true
+	if [ -n "$(ls -A "$respdir" 2>/dev/null)" ]; then
+		echo "[cammk] $label icin trufflehog baslatiliyor..."
+		trufflehog filesystem "$respdir" --no-update > "$OUTPUT_DIR/thog_$label"
+		[ ! -s "$OUTPUT_DIR/thog_$label" ] && rm -f "$OUTPUT_DIR/thog_$label"
 	else
-		echo "[cammk] domaine bagli github reposu bulunamadi"
+		echo "[cammk] $label icin indirilmis yanit yok, trufflehog atlaniyor."
+	fi
+	if [ -f "$OUTPUT_DIR/thog_$label" ]; then
+		echo "[cammk] $label icinde key/secret bulundu. $OUTPUT_DIR icerisinde kontrol ediniz."
+	else
+		echo "[cammk] $label icinde key/secret bulunamadi."
+	fi
+}
+
+#online swagger/postman leak arama
+run_swagger_postman(){
+	echo "[cammk] online swagger/postman leak aramasi (swaggerhub + postman)..."
+	# curl varsayilan UA bloklanabiliyor, tarayici gibi tanitiliyor
+	local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+	local raw="$OUTPUT_DIR/.sp_raw"
+
+	# 1) swaggerhub public spec arama -> spec (swagger.json) url'leri
+	curl -s --max-time 30 -A "$ua" -H "accept: application/json" \
+		"https://app.swaggerhub.com/apiproxy/specs?sort=BEST_MATCH&order=DESC&query=${TARGET}&page=0&limit=100" \
+		> "$raw" 2>/dev/null || true
+	jq -r '.apis[]?.properties[]? | select(.url != null) | .url' "$raw" 2>/dev/null \
+		| sort -u > "$OUTPUT_DIR/swagger_results" || true
+	if [ -s "$OUTPUT_DIR/swagger_results" ]; then
+		echo "[cammk] swaggerhub: $(wc -l < "$OUTPUT_DIR/swagger_results") spec url bulundu."
+	else
+		echo "[cammk] swaggerhub sonuc uretmedi."
+		rm -f "$OUTPUT_DIR/swagger_results"
+	fi
+
+	# 2) postman public arama -> request url'leri ({{baseUrl}} varsa cozulur)
+	local body="{\"service\":\"search\",\"method\":\"POST\",\"path\":\"/search-all\",\"body\":{\"queryIndices\":[\"runtime.request\"],\"queryText\":\"${TARGET}\",\"size\":100,\"from\":0,\"requestOrigin\":\"srp\",\"mergeEntities\":\"true\",\"nonNestedRequests\":\"true\"}}"
+	curl -s --max-time 30 -A "$ua" -H "Content-Type: application/json" \
+		-X POST "https://www.postman.com/_api/ws/proxy" -d "$body" \
+		> "$raw" 2>/dev/null || true
+	jq -r '.data[]?.document? | select(.url != null) | .baseUrl as $b | .url | gsub("\\{\\{baseUrl\\}\\}"; ($b // ""))' "$raw" 2>/dev/null \
+		| sort -u > "$OUTPUT_DIR/postman_results" || true
+	if [ -s "$OUTPUT_DIR/postman_results" ]; then
+		echo "[cammk] postman: $(wc -l < "$OUTPUT_DIR/postman_results") request url bulundu."
+	else
+		echo "[cammk] postman sonuc uretmedi."
+		rm -f "$OUTPUT_DIR/postman_results"
+	fi
+	rm -f "$raw"
+
+	# her sonuc dosyasi ayri ayri indirilip trufflehog ile taranir (gau'dan bagimsiz)
+	sp_secret_scan "$OUTPUT_DIR/swagger_results" swagger
+	sp_secret_scan "$OUTPUT_DIR/postman_results" postman
+}
+
+#github secret leak
+#github token required
+run_github(){
+	echo "[cammk] github code search ile domaini iceren repolar araniyor..."
+
+	# code search auth ister: keys.yaml'daki github token (yoksa adim atlanir)
+	local gh_token=""
+	[ -f "$OUTPUT_DIR/keys.yaml" ] && gh_token=$(grep -A1 '^github:' "$OUTPUT_DIR/keys.yaml" 2>/dev/null | sed -n 's/^ *- *//p' | head -1)
+	if [ -z "$gh_token" ]; then
+		echo "[!] github token yok (keys.yaml). code search icin gerekli, adim atlaniyor. (--skip-keys kullandiysaniz once key girin)"
+		return 0
+	fi
+
+	local raw="$OUTPUT_DIR/.gh_raw"
+	# -G + --data-urlencode: q dogru sekilde url-encode edilir
+	curl -s --max-time 30 -G \
+		-H "Authorization: Bearer $gh_token" \
+		-H "Accept: application/vnd.github+json" \
+		-H "X-GitHub-Api-Version: 2022-11-28" \
+		--data-urlencode "q=$TARGET" \
+		--data-urlencode "per_page=100" \
+		"https://api.github.com/search/code" > "$raw" 2>/dev/null || true
+	jq -r '.items[]?.repository.full_name' "$raw" 2>/dev/null | sort -u > "$OUTPUT_DIR/github_results" || true
+	rm -f "$raw"
+
+	if [ ! -s "$OUTPUT_DIR/github_results" ]; then
+		echo "[cammk] domaine bagli github reposu bulunamadi."
 		rm -f "$OUTPUT_DIR/github_results"
+		return 0
+	fi
+	echo "[cammk] $(wc -l < "$OUTPUT_DIR/github_results") repo bulundu, trufflehog ile taraniyor..."
+
+	: > "$OUTPUT_DIR/thog_github"
+	while IFS= read -r repo; do
+		[ -z "$repo" ] && continue
+		echo "[cammk] trufflehog: $repo"
+		# </dev/null: trufflehog loop stdin'ini (repo listesi) yemesin
+		trufflehog github --repo "https://github.com/$repo" --token "$gh_token" --no-update </dev/null 2>/dev/null >> "$OUTPUT_DIR/thog_github" || true
+	done < "$OUTPUT_DIR/github_results"
+
+	if [ -s "$OUTPUT_DIR/thog_github" ]; then
+		echo "[cammk] github repolarinda key/secret bulundu. $OUTPUT_DIR/thog_github kontrol ediniz."
+	else
+		echo "[cammk] github repolarinda key/secret bulunamadi."
+		rm -f "$OUTPUT_DIR/thog_github"
 	fi
 }
 
@@ -384,6 +492,44 @@ run_katana_js(){
 	fi
 }
 
+#fuzzing - ffuf ile canli hostlarda gizli dizin/dosya/panel aramasi
+run_fuzz(){
+	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
+		echo "[cammk] canli host yok, fuzzing atlaniyor."
+		return 0
+	fi
+	if [ ! -f "$FUZZ_WORDLIST" ]; then
+		echo "[!] fuzz wordlist yok ($FUZZ_WORDLIST), fuzzing atlaniyor. (script klasorune 'fuzz_wordlist.txt' koyun)"
+		return 0
+	fi
+	echo "[cammk] ffuf ile fuzzing yapiliyor..."
+	: > "$OUTPUT_DIR/fuzz_results"
+	while IFS= read -r host; do
+		[ -z "$host" ] && continue
+		# -ac: wildcard/false-positive, -s: sadece bulunan path'i yaz
+		# </dev/null: ffuf interaktif konsolu loop stdin'ini (host dosyasini) yiyip takilmasin
+		ffuf -u "${host%/}/FUZZ" -w "$FUZZ_WORDLIST" -mc 200,204,301,302,307,401,403,405 -ac -t 40 -rate 100 -timeout 10 -s </dev/null 2>/dev/null \
+			| sed "s#^#${host%/}/#" >> "$OUTPUT_DIR/fuzz_results" || true
+	done < "$OUTPUT_DIR/live_subdomains"
+	sort -u "$OUTPUT_DIR/fuzz_results" -o "$OUTPUT_DIR/fuzz_results"
+	[ -s "$OUTPUT_DIR/fuzz_results" ] && echo "[cammk] fuzzing tamamlandi. $(wc -l < "$OUTPUT_DIR/fuzz_results") sonuc fuzz_results dosyasina kaydedildi." || echo "[cammk] fuzzing sonuc uretmedi."
+}
+
+#dedupe + 404/fp ayiklama - tum kaynaklardan url'leri birlestir, httpx ile canli olanlari dogrula
+#not: 403/404 de canli sayilir (hedeftir), status code filtrelenmez
+run_dedupe(){
+	cat "$OUTPUT_DIR/gau_filtered" "$OUTPUT_DIR/api_endpoints" "$OUTPUT_DIR/katana_urls" \
+		"$OUTPUT_DIR/fuzz_results" "$OUTPUT_DIR/live_subdomains" 2>/dev/null \
+		| sort -u > "$OUTPUT_DIR/all_urls"
+	if [ ! -s "$OUTPUT_DIR/all_urls" ]; then
+		echo "[cammk] birlestirilecek url yok, dedupe atlaniyor."
+		return 0
+	fi
+	echo "[cammk] $(wc -l < "$OUTPUT_DIR/all_urls") url httpx ile dogrulaniyor (dedupe + fp/404)..."
+	cat "$OUTPUT_DIR/all_urls" | httpx-toolkit -silent -status-code -title -o "$OUTPUT_DIR/all_live_urls"
+	[ -s "$OUTPUT_DIR/all_live_urls" ] && echo "[cammk] dedupe tamamlandi. $(wc -l < "$OUTPUT_DIR/all_live_urls") canli url all_live_urls dosyasina kaydedildi." || echo "[cammk] canli url bulunamadi."
+}
+
 
 #pipeline: her adim SKIP_* bayragina gore calisir
 run_step(){
@@ -404,6 +550,7 @@ main(){
 	run_step SKIP_SUBFINDER   run_subfinder
 	run_step SKIP_GAU         run_gau
 	run_step SKIP_API_SORT    run_api_sort
+	run_step SKIP_SWAGGER_POSTMAN run_swagger_postman
 	run_step SKIP_GITHUB      run_github
 
 	run_step SKIP_BRUTE       run_brute
@@ -416,6 +563,8 @@ main(){
 	run_step SKIP_WHATWEB     run_whatweb
 	run_step SKIP_KATANA      run_katana
 	run_step SKIP_KATANA_JS   run_katana_js
+	run_step SKIP_FUZZ        run_fuzz
+	run_step SKIP_DEDUPE      run_dedupe
 
 	echo "[cammk] pipeline tamamlandi."
 }
