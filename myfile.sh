@@ -159,6 +159,8 @@ api_key_setup(){
     read -s -p "Shodan API key: "     shodan_key; echo
     read -s -p "VirusTotal API key: " vt_key;     echo
     read -s -p "GitHub API key: "     github_key; echo
+    read -s -p "Chaos API key: "      chaos_key;  echo
+    read -s -p "Censys API key: "     censys_key; echo
 
     > "$config_file"
     chmod 600 "$config_file" #keys file protection
@@ -178,6 +180,8 @@ api_key_setup(){
     append_key_to_yaml "shodan" "$shodan_key"
     append_key_to_yaml "virustotal" "$vt_key"
     append_key_to_yaml "github" "$github_key"
+    append_key_to_yaml "chaos" "$chaos_key"
+    append_key_to_yaml "censys" "$censys_key"
     echo "API key ayarlama islemi tamamlandi. dosya: $config_file"
 }
 
@@ -337,7 +341,7 @@ run_github(){
 #subdomain bruteforce dnsx
 run_brute(){
 	echo "[cammk] dnsx subdomain bruteforce baslatiliyor..."
-	dnsx -d "$TARGET" -w "$WORDLIST" -silent -o "$OUTPUT_DIR/dnsx_brute_results"
+	dnsx -d "$TARGET" -w "$WORDLIST" -silent -retry 2 -o "$OUTPUT_DIR/dnsx_brute_results"
 	if [ -s "$OUTPUT_DIR/dnsx_brute_results" ]; then
 		echo "[cammk] bruteforce ile $(wc -l < "$OUTPUT_DIR/dnsx_brute_results") yeni subdomain adayi bulundu."
 	else
@@ -384,7 +388,7 @@ run_api_secrets(){
 #dnsx (ACTIVE: DNS cozumleme)
 run_resolve(){
 	echo "[cammk] ipler resolvelaniyor..."
-	cat "$OUTPUT_DIR/subdomains_list" | dnsx -a -resp-only | sort -u > "$OUTPUT_DIR/resolved_ips"
+	cat "$OUTPUT_DIR/subdomains_list" | dnsx -a -resp-only -retry 2 | sort -u > "$OUTPUT_DIR/resolved_ips"
 	[ -s "$OUTPUT_DIR/resolved_ips" ] || echo "[!] ip resolve edilemedi, masscan/naabu bos donebilir."
 }
 
