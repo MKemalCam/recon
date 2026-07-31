@@ -22,6 +22,8 @@ SKIP_KATANA=false
 SKIP_KATANA_JS=false
 SKIP_FUZZ=false
 SKIP_DEDUPE=false
+SKIP_NUCLEI=false
+SKIP_WAFW00F=false
 
 TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,6 +64,8 @@ Adim atlama flaglari:
   --skip-katana-js     katana js dosyalarini indir + trufflehog
   --skip-fuzz          ffuf ile dizin/dosya fuzzing
   --skip-dedupe        tum url'leri birlestir + httpx 404/fp ayikla
+  --skip-nuclei        nuclei ile exposure/CWE-200 taramasi (WAF korumali)
+  --skip-wafw00f       wafw00f WAF vendor kimligi + gizli WAF tespiti (nuclei icinde)
 
 Ornek:
   $0 -d testfire.net --skip-gau --skip-github
@@ -97,6 +101,8 @@ parse_args(){
 			--skip-katana-js)   SKIP_KATANA_JS=true;   shift ;;
 			--skip-fuzz)        SKIP_FUZZ=true;        shift ;;
 			--skip-dedupe)      SKIP_DEDUPE=true;      shift ;;
+			--skip-nuclei)      SKIP_NUCLEI=true;      shift ;;
+			--skip-wafw00f)     SKIP_WAFW00F=true;     shift ;;
 			*)
 				if [[ -z "$TARGET" ]]; then TARGET="$1"; shift
 				else echo "[!] Bilinmeyen arguman: $1"; show_usage; exit 1; fi ;;
@@ -126,7 +132,7 @@ setup_output(){
 
 check_deps(){
 	local missing=0
-	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog whatweb katana ffuf curl jq; do
+	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog whatweb katana ffuf nuclei wafw00f curl jq; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "[!] eksik arac: $tool"
 			missing=1
@@ -534,6 +540,146 @@ run_dedupe(){
 	[ -s "$OUTPUT_DIR/all_live_urls" ] && echo "[cammk] dedupe tamamlandi. $(wc -l < "$OUTPUT_DIR/all_live_urls") canli url all_live_urls dosyasina kaydedildi." || echo "[cammk] canli url bulunamadi."
 }
 
+############################################
+###               VULN SCAN              ###
+############################################
+
+#--- WAF farkindalik yardimcilari ---
+#curl yardimcilari (asagi): SADECE benign/rastgele-yol prob — anlik blok DURUMUNU olcer, saldiri sekilli istek YOK.
+#waf_fingerprint (wafw00f): VENDOR kimligi + gizli 200-challenge WAF tespiti. wafw00f flag ile disable edilebilir cunku saldiri payload atiyor
+waf_probe_status(){
+	local url="$1" ua="$2" rand
+	rand="zz$(date +%s%N | tail -c 7)$RANDOM"
+	curl -s -o /dev/null -m 10 -A "$ua" -w '%{http_code}' "${url%/}/$rand" 2>/dev/null
+}
+
+#rastgele yol normalde 404/200 doner; 403/406/429/503 = WAF araya giriyor/blokluyor
+waf_is_blocked_status(){
+	case "$1" in 403|406|429|503) return 0 ;; *) return 1 ;; esac
+}
+
+#tarama oncesi: challenge donen host'lari ayir -> hosts_open / hosts_defended
+waf_classify(){
+	local ua="$1" url status
+	: > "$OUTPUT_DIR/hosts_open"; : > "$OUTPUT_DIR/hosts_defended"
+	while IFS= read -r url; do
+		[ -z "$url" ] && continue
+		status=$(waf_probe_status "$url" "$ua")
+		if waf_is_blocked_status "$status"; then
+			echo "$url" >> "$OUTPUT_DIR/hosts_defended"
+		else
+			echo "$url" >> "$OUTPUT_DIR/hosts_open"
+		fi
+	done < "$OUTPUT_DIR/live_subdomains"
+	echo "[cammk] WAF on-tespiti: $(wc -l < "$OUTPUT_DIR/hosts_open" 2>/dev/null | tr -d ' ') acik, $(wc -l < "$OUTPUT_DIR/hosts_defended" 2>/dev/null | tr -d ' ') WAF/challenge (taramadan ayrildi)."
+}
+
+#tarama sonrasi canary: acik host'lar hala erisilebilir mi? bloklandiysa 'temiz' sonucu guvenilmez
+waf_canary(){
+	local ua="$1" url status
+	: > "$OUTPUT_DIR/hosts_blocked"
+	while IFS= read -r url; do
+		[ -z "$url" ] && continue
+		status=$(waf_probe_status "$url" "$ua")
+		waf_is_blocked_status "$status" && echo "$url" >> "$OUTPUT_DIR/hosts_blocked"
+	done < "$OUTPUT_DIR/hosts_open"
+	if [ -s "$OUTPUT_DIR/hosts_blocked" ]; then
+		echo "[!] UYARI: $(wc -l < "$OUTPUT_DIR/hosts_blocked" | tr -d ' ') host tarama SIRASINDA bloklandi (bkz hosts_blocked)."
+		echo "[!] Bu host'lardaki 'bulgu yok' sonucu GUVENILMEZ — manuel/origin inceleme gerekir."
+	fi
+}
+
+#wafw00f ile WAF VENDOR kimligi + gizli WAF ayiklama (curl status-prob'un kacirdigi 200-challenge WAF'lar)
+waf_fingerprint(){
+	if ! command -v wafw00f >/dev/null 2>&1; then
+		echo "[cammk] wafw00f kurulu degil, WAF vendor kimligi atlaniyor."
+		return 0
+	fi
+	[ -s "$OUTPUT_DIR/hosts_open" ] || return 0
+
+	echo "[cammk] wafw00f: $(wc -l < "$OUTPUT_DIR/hosts_open" | tr -d ' ') acik host'ta WAF vendor kimligi taraniyor..."
+	wafw00f -i "$OUTPUT_DIR/hosts_open" -f json -o "$OUTPUT_DIR/waf_fingerprints.json" >/dev/null 2>&1 || true
+	if [ ! -s "$OUTPUT_DIR/waf_fingerprints.json" ]; then
+		echo "[cammk] wafw00f ciktisi bos/parse edilemedi, atlaniyor."
+		return 0
+	fi
+
+	# tespit edilen WAF'lar -> vendor annotasyonu (url \t firewall)
+	jq -r '.[] | select(.detected==true) | "\(.url)\t\(.firewall)"' \
+		"$OUTPUT_DIR/waf_fingerprints.json" 2>/dev/null > "$OUTPUT_DIR/waf_vendors.txt" || true
+	if [ ! -s "$OUTPUT_DIR/waf_vendors.txt" ]; then
+		echo "[cammk] wafw00f acik host'larda WAF tespit etmedi."
+		return 0
+	fi
+
+	# curl 'acik' dedigi ama wafw00f WAF gordugu host = GIZLI WAF (status-prob kacirdi, 200-challenge)
+	# tarama setinden cikar: hem ban riski hem guvenilmez 'temiz' sonuc onlenir
+	local drop="$OUTPUT_DIR/.stealth_urls"
+	cut -f1 "$OUTPUT_DIR/waf_vendors.txt" | grep -xF -f - "$OUTPUT_DIR/hosts_open" > "$drop" 2>/dev/null || true
+	if [ -s "$drop" ]; then
+		grep -F -f "$drop" "$OUTPUT_DIR/waf_vendors.txt" > "$OUTPUT_DIR/hosts_stealth_waf" 2>/dev/null || true
+		grep -vxF -f "$drop" "$OUTPUT_DIR/hosts_open" > "$OUTPUT_DIR/hosts_open.tmp" 2>/dev/null || true
+		mv "$OUTPUT_DIR/hosts_open.tmp" "$OUTPUT_DIR/hosts_open"
+		cat "$drop" >> "$OUTPUT_DIR/hosts_defended"
+		echo "[!] wafw00f, curl'un 'acik' dedigi $(wc -l < "$drop" | tr -d ' ') host'ta GIZLI WAF buldu — taramadan cikarildi (bkz hosts_stealth_waf)."
+	fi
+	rm -f "$drop"
+
+	echo "[cammk] WAF vendor dagilimi (acik host'lar):"
+	cut -f2 "$OUTPUT_DIR/waf_vendors.txt" | sort | uniq -c | sort -rn
+}
+
+#nuclei ile CWE-200 taramasi
+run_nuclei(){
+	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
+		echo "[cammk] canli host yok, nuclei taramasi atlaniyor."
+		return 0
+	fi
+
+	# WAF korumasi: varsayilan random-agent yerine sabit/gercekci tarayici UA
+	local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+	# WAF on-tespiti (curl, benign): anlik challenge/blok donen host'lari taramadan ayir
+	waf_classify "$ua"
+	# WAF vendor kimligi (wafw00f, opt-in): curl'un kacirdigi gizli 200-challenge WAF'lari da ayikla
+	if [ "$SKIP_WAFW00F" != true ]; then
+		waf_fingerprint
+	else
+		echo "[cammk] (atlandi) wafw00f vendor kimligi — SKIP_WAFW00F=true"
+	fi
+	if [ ! -s "$OUTPUT_DIR/hosts_open" ]; then
+		echo "[!] taranabilir 'acik' host yok, ip ban veya tamami waflandi, nuclei atlaniyor."
+		return 0
+	fi
+
+	# template setleri: resmi exposures agaci + (varsa) elle yazilmis template'lerimiz
+	local -a tmpl=(-t http/exposures/)
+	if [ -d "$SCRIPT_DIR/nuclei_templates" ] && [ -n "$(ls -A "$SCRIPT_DIR/nuclei_templates" 2>/dev/null)" ]; then
+		tmpl+=(-t "$SCRIPT_DIR/nuclei_templates/")
+	fi
+
+	echo "[cammk] nuclei exposure/CWE-200 taramasi baslatiliyor..."
+	nuclei -l "$OUTPUT_DIR/hosts_open" \
+		"${tmpl[@]}" \
+		-severity low,medium,high,critical \
+		-ss host-spray -rl 5 -c 25 -bs 25 \
+		-retries 2 -timeout 10 -mhe 30 \
+		-H "User-Agent: $ua" \
+		-stats -si 30 \
+		-o "$OUTPUT_DIR/nuclei_exposures.txt" \
+		-je "$OUTPUT_DIR/nuclei_exposures.json" || true
+
+	if [ -s "$OUTPUT_DIR/nuclei_exposures.txt" ]; then
+		echo "[cammk] nuclei tamamlandi. $(wc -l < "$OUTPUT_DIR/nuclei_exposures.txt") bulgu nuclei_exposures.txt dosyasina kaydedildi."
+	else
+		echo "[cammk] nuclei bulgu uretmedi."
+		rm -f "$OUTPUT_DIR/nuclei_exposures.txt"
+	fi
+
+	# tarama sonrasi canary: acik host'lar tarama boyunca bloklandi mi? (temiz sonuc guvenilir mi?)
+	waf_canary "$ua"
+}
+
 
 #pipeline: her adim SKIP_* bayragina gore calisir
 run_step(){
@@ -569,6 +715,7 @@ main(){
 	run_step SKIP_KATANA_JS   run_katana_js
 	run_step SKIP_FUZZ        run_fuzz
 	run_step SKIP_DEDUPE      run_dedupe
+	run_step SKIP_NUCLEI      run_nuclei
 
 	echo "[cammk] pipeline tamamlandi."
 }
