@@ -1,0 +1,64 @@
+id: subdir-archive-backup-exposure
+
+info:
+  name: Archive Backup in Common Subdirectory - Detect
+  author: cammk
+  severity: medium
+  description: |
+    Detects domain-named or generic compressed backups exposed inside common backup
+    subdirectories (/backup, /backups, /old, /files, /download). Complements the stock
+    zip-backup-files template, which only enumerates the web root. Confirmed via archive
+    magic bytes, so an HTML soft-404 page cannot produce a false positive.
+  reference:
+    - https://cwe.mitre.org/data/definitions/200.html
+  classification:
+    cvss-metrics: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N
+    cvss-score: 5.3
+    cwe-id: CWE-200
+  metadata:
+    max-request: 180
+  tags: exposure,backup,cwe200
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/{{DIR}}/{{FILE}}.{{EXT}}"
+    attack: clusterbomb
+    payloads:
+      DIR:
+        - "backup"
+        - "backups"
+        - "old"
+        - "files"
+        - "download"
+      FILE:
+        - "{{RDN}}"      # example.com
+        - "{{SD}}"       # www (subdomain label)
+        - "backup"
+        - "www"
+        - "db"
+        - "site"
+      EXT:
+        - "zip"
+        - "tar"
+        - "tar.gz"
+        - "rar"
+        - "7z"
+        - "sql.gz"
+    stop-at-first-match: true   # one confirmed backup per host is enough
+    max-size: 500               # only read the first 500 bytes; magic bytes live at the start
+
+    matchers-condition: and
+    matchers:
+      - type: binary            # prove it is really an archive (this IS the anti-soft-404 guard)
+        part: body
+        condition: or
+        binary:
+          - "504B0304"          # PK.. -> zip
+          - "1f8b"              # -> gzip (tar.gz, sql.gz)
+          - "526172211A0700"    # Rar! -> rar
+          - "377ABCAF271C"      # 7z\xBC\xAF'.  -> 7-Zip
+          - "7573746172"        # ustar -> tar (POSIX magic at offset 257)
+      - type: status
+        status:
+          - 200
