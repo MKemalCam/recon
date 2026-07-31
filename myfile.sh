@@ -652,12 +652,13 @@ run_nuclei(){
 		return 0
 	fi
 
-	# template setleri: resmi exposures agaci + (varsa) elle yazilmis template'lerimiz
-	local -a tmpl=(-t http/exposures/)
-	if [ -d "$SCRIPT_DIR/nuclei_templates" ] && [ -n "$(ls -A "$SCRIPT_DIR/nuclei_templates" 2>/dev/null)" ]; then
-		tmpl+=(-t "$SCRIPT_DIR/nuclei_templates/")
+	# template check
+	if [ ! -d "$SCRIPT_DIR/nuclei_templates" ] || [ -z "$(ls -A "$SCRIPT_DIR/nuclei_templates" 2>/dev/null)" ]; then
+		echo "[cammk] nuclei_templates/ bos veya yok — taranacak custom template yok, nuclei atlaniyor."
+		return 0
 	fi
-
+	local -a tmpl=(-t "$SCRIPT_DIR/nuclei_templates/")
+	
 	echo "[cammk] nuclei exposure/CWE-200 taramasi baslatiliyor..."
 	nuclei -l "$OUTPUT_DIR/hosts_open" \
 		"${tmpl[@]}" \
@@ -665,6 +666,7 @@ run_nuclei(){
 		-ss host-spray -rl 5 -c 25 -bs 25 \
 		-retries 2 -timeout 10 -mhe 30 \
 		-H "User-Agent: $ua" \
+		-hpd -shp \
 		-stats -si 30 \
 		-o "$OUTPUT_DIR/nuclei_exposures.txt" \
 		-je "$OUTPUT_DIR/nuclei_exposures.json" || true
