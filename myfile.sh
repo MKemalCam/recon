@@ -545,7 +545,7 @@ run_dedupe(){
 ############################################
 
 #--- WAF farkindalik yardimcilari ---
-#curl yardimcilari (asagi): SADECE benign/rastgele-yol prob — anlik blok DURUMUNU olcer, saldiri sekilli istek YOK.
+#curl yardimcilari (asagi): SADECE benign/rastgele-yol prob
 #waf_fingerprint (wafw00f): VENDOR kimligi + gizli 200-challenge WAF tespiti. wafw00f flag ile disable edilebilir cunku saldiri payload atiyor
 waf_probe_status(){
 	local url="$1" ua="$2" rand
