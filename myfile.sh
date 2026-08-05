@@ -24,6 +24,10 @@ SKIP_FUZZ=false
 SKIP_DEDUPE=false
 SKIP_NUCLEI=false
 SKIP_WAFW00F=false
+SKIP_ORIGIN=false
+CF_BYPASS=true
+JITTER=true
+RATE=5          # saniyede istek siniri (--rate)
 
 TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +39,24 @@ COMMON_HTTP_PORTS="80,81,300,443,591,593,832,981,1010,1311,1099,2082,2095,2096,2
 
 NAABU_PORTS=common
 
+#User-Agent havuzu (her calismada biri secilir)
+UA_POOL=(
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+)
+USER_AGENT=""   # setup_output icinde rastgele secilir
+
+#Cloudflare IPv4 aralari (kaynak: cloudflare.com/ips-v4)
+CF_CIDRS=(
+	173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
+	141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20
+	197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13
+	104.24.0.0/14 172.64.0.0/13 131.0.72.0/22
+)
+
 show_usage(){
 	cat << EOF
 Kullanim: $0 (-d <domain> | <domain>) [--skip-<adim> ...]
@@ -44,6 +66,7 @@ Argumanlar:
   -h, --help           Bu yardimi goster
   --naabu-ports <m>    naabu port kapsami: common (varsayilan) | all
                        common = ortak HTTP/panel portlari, all = 1-65535
+  --rate <n>           tum aktif araclarda saniyede istek siniri (varsayilan 5; ban riskine karsi dusur, or. 2)
 
 Adim atlama flaglari:
   --skip-keys          api key setup
@@ -66,6 +89,9 @@ Adim atlama flaglari:
   --skip-dedupe        tum url'leri birlestir + httpx 404/fp ayikla
   --skip-nuclei        nuclei ile exposure/CWE-200 taramasi (WAF korumali)
   --skip-wafw00f       wafw00f WAF vendor kimligi + gizli WAF tespiti (nuclei icinde)
+  --skip-origin        Cloudflare arkasi origin IP tespiti (aktif recon sonu)
+  --skip-cf-bypass     dogrulanmis origin IP'leri nuclei hedeflerine EKLEME (varsayilan: ekli — KAPSAM DISI riski!)
+  --no-jitter          istekler arasi rastgele gecikmeyi kapat
 
 Ornek:
   $0 -d testfire.net --skip-gau --skip-github
@@ -83,6 +109,9 @@ parse_args(){
 			--naabu-ports)
 				if [[ "${2:-}" =~ ^(common|all)$ ]]; then NAABU_PORTS="$2"; shift 2
 				else echo "[!] --naabu-ports sadece 'common' veya 'all' kabul eder"; exit 1; fi ;;
+			--rate)
+				if [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "${2:-0}" -ge 1 ]; then RATE="$2"; shift 2
+				else echo "[!] --rate pozitif tam sayi ister (or. --rate 2)"; exit 1; fi ;;
 			--skip-keys)        SKIP_KEYS=true;        shift ;;
 			--skip-subfinder)   SKIP_SUBFINDER=true;   shift ;;
 			--skip-gau)         SKIP_GAU=true;         shift ;;
@@ -103,6 +132,9 @@ parse_args(){
 			--skip-dedupe)      SKIP_DEDUPE=true;      shift ;;
 			--skip-nuclei)      SKIP_NUCLEI=true;      shift ;;
 			--skip-wafw00f)     SKIP_WAFW00F=true;     shift ;;
+			--skip-origin)      SKIP_ORIGIN=true;      shift ;;
+			--skip-cf-bypass)   CF_BYPASS=false;       shift ;;
+			--no-jitter)        JITTER=false;          shift ;;
 			*)
 				if [[ -z "$TARGET" ]]; then TARGET="$1"; shift
 				else echo "[!] Bilinmeyen arguman: $1"; show_usage; exit 1; fi ;;
@@ -127,6 +159,10 @@ setup_output(){
 	SAFE_TARGET=$(echo "$TARGET" | tr -c 'A-Za-z0-9._-' '_')
 	OUTPUT_DIR="cammk_${SAFE_TARGET}"
 	mkdir -p "$OUTPUT_DIR"
+
+	# bu calisma icin rastgele UA sec
+	USER_AGENT="${UA_POOL[$((RANDOM % ${#UA_POOL[@]}))]}"
+	echo "[cammk] bu calisma icin User-Agent: $USER_AGENT"
 }
 
 
@@ -139,6 +175,36 @@ check_deps(){
 		fi
 	done
 	[ "$missing" -eq 1 ] && echo "[!] Eksik araclar var, devam edilse de ilgili adimlar basarisiz olabilir."
+}
+
+
+#--- stealth / CF yardimcilari ---
+#istekler arasi rastgele gecikme (--no-jitter kapatir)
+jitter(){
+	[ "$JITTER" != true ] && return 0
+	local ms=$(( (RANDOM % 1300) + 200 ))   # 0.2 - 1.5 sn
+	sleep "$(awk "BEGIN{printf \"%.3f\", $ms/1000}")"
+}
+
+#nokta-notasyonlu IPv4 -> 32-bit tamsayi
+ip_to_int(){
+	local IFS=. a b c d
+	read -r a b c d <<< "$1"
+	echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+
+#IP bir Cloudflare CIDR'inde mi?
+is_cf_ip(){
+	local ip="$1" cidr base bits ipint baseint mask
+	[[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+	ipint=$(ip_to_int "$ip")
+	for cidr in "${CF_CIDRS[@]}"; do
+		base="${cidr%/*}"; bits="${cidr#*/}"
+		baseint=$(ip_to_int "$base")
+		mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+		(( (ipint & mask) == (baseint & mask) )) && return 0
+	done
+	return 1
 }
 
 
@@ -234,7 +300,7 @@ sp_secret_scan(){
 	mkdir -p "$respdir"
 	echo "[cammk] $label icerikleri indiriliyor..."
 	# sadece cozulmus http(s) url'ler indirilir ({{baseUrl}} kalanlar atlanir)
-	grep -iE '^https?://' "$urls" | httpx-toolkit -silent -rl 5 -t 2 -random-agent -sr -srd "$respdir" || true
+	grep -iE '^https?://' "$urls" | httpx-toolkit -silent -rl "$RATE" -t 2 -random-agent -sr -srd "$respdir" || true
 	if [ -n "$(ls -A "$respdir" 2>/dev/null)" ]; then
 		echo "[cammk] $label icin trufflehog baslatiliyor..."
 		trufflehog filesystem "$respdir" --no-update > "$OUTPUT_DIR/thog_$label"
@@ -252,8 +318,8 @@ sp_secret_scan(){
 #online swagger/postman leak arama
 run_swagger_postman(){
 	echo "[cammk] online swagger/postman leak aramasi (swaggerhub + postman)..."
-	# curl varsayilan UA bloklanabiliyor, tarayici gibi tanitiliyor
-	local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+	# curl varsayilan UA bloklanabiliyor (bu calismanin UA'si)
+	local ua="$USER_AGENT"
 	local raw="$OUTPUT_DIR/.sp_raw"
 
 	# 1) swaggerhub public spec arama -> spec (swagger.json) url'leri
@@ -369,7 +435,7 @@ run_api_secrets(){
 		echo "[cammk] api endpoint bulundu. sonuclar $OUTPUT_DIR/api_endpoints dosyasına kaydedildi."
 		mkdir -p "$OUTPUT_DIR/api_responses"
 		echo "[cammk] api endpoint icerikleri indiriliyor..."
-		cat "$OUTPUT_DIR/api_endpoints" | httpx-toolkit -silent -rl 5 -t 2 -random-agent -sr -srd "$OUTPUT_DIR/api_responses"
+		cat "$OUTPUT_DIR/api_endpoints" | httpx-toolkit -silent -rl "$RATE" -t 2 -random-agent -sr -srd "$OUTPUT_DIR/api_responses"
 
 
 		if [ -d "$OUTPUT_DIR/api_responses" ] && [ -n "$(ls -A "$OUTPUT_DIR/api_responses" 2>/dev/null)" ]; then
@@ -454,7 +520,7 @@ run_whatweb(){
 		return 0
 	fi
 	echo "[cammk] whatweb ile teknoloji tespiti yapiliyor..."
-	whatweb -i "$OUTPUT_DIR/live_subdomains" -a 3 -t 25 --no-errors \
+	whatweb -i "$OUTPUT_DIR/live_subdomains" -a 3 -t 5 --no-errors \
 		--log-brief="$OUTPUT_DIR/whatweb_brief.txt" \
 		--log-json="$OUTPUT_DIR/whatweb.json"
 	echo "[cammk] whatweb tamamlandi. ozet: whatweb_brief.txt, json: whatweb.json"
@@ -467,7 +533,7 @@ run_katana(){
 		return 0
 	fi
 	echo "[cammk] katana ile crawl yapiliyor..."
-	katana -list "$OUTPUT_DIR/live_subdomains" -jc -kf all -d 3 -c 10 -rl 150 -silent -o "$OUTPUT_DIR/katana_urls"
+	katana -list "$OUTPUT_DIR/live_subdomains" -jc -kf all -d 3 -c 3 -rl "$RATE" -silent -o "$OUTPUT_DIR/katana_urls"
 	[ -s "$OUTPUT_DIR/katana_urls" ] && echo "[cammk] katana tamamlandi. $(wc -l < "$OUTPUT_DIR/katana_urls") url katana_urls dosyasina kaydedildi." || echo "[!] katana url uretmedi."
 }
 
@@ -485,7 +551,7 @@ run_katana_js(){
 	fi
 	echo "[cammk] $(wc -l < "$OUTPUT_DIR/katana_js_urls") js dosyasi indiriliyor..."
 	mkdir -p "$OUTPUT_DIR/katana_js_responses"
-	cat "$OUTPUT_DIR/katana_js_urls" | httpx-toolkit -silent -rl 5 -t 2 -random-agent -sr -srd "$OUTPUT_DIR/katana_js_responses"
+	cat "$OUTPUT_DIR/katana_js_urls" | httpx-toolkit -silent -rl "$RATE" -t 2 -random-agent -sr -srd "$OUTPUT_DIR/katana_js_responses"
 
 	if [ -d "$OUTPUT_DIR/katana_js_responses" ] && [ -n "$(ls -A "$OUTPUT_DIR/katana_js_responses" 2>/dev/null)" ]; then
 		echo "[cammk] js dosyalarinda secret aramalari yapilacak. trufflehog baslatiliyor..."
@@ -518,7 +584,7 @@ run_fuzz(){
 		[ -z "$host" ] && continue
 		# -ac: wildcard/false-positive, -s: sadece bulunan path'i yaz
 		# </dev/null: ffuf interaktif konsolu loop stdin'ini (host dosyasini) yiyip takilmasin
-		ffuf -u "${host%/}/FUZZ" -w "$FUZZ_WORDLIST" -mc 200,204,301,302,307,401,403,405 -ac -t 40 -rate 100 -timeout 10 -s </dev/null 2>/dev/null \
+		ffuf -u "${host%/}/FUZZ" -w "$FUZZ_WORDLIST" -mc 200,204,301,302,307,401,403,405 -ac -t 5 -rate "$RATE" -p 0.1-0.5 -timeout 10 -s </dev/null 2>/dev/null \
 			| sed "s#^#${host%/}/#" >> "$OUTPUT_DIR/fuzz_results" || true
 	done < "$OUTPUT_DIR/live_subdomains"
 	sort -u "$OUTPUT_DIR/fuzz_results" -o "$OUTPUT_DIR/fuzz_results"
@@ -545,15 +611,14 @@ run_dedupe(){
 ############################################
 
 #--- WAF farkindalik yardimcilari ---
-#curl yardimcilari (asagi): SADECE benign/rastgele-yol prob
-#waf_fingerprint (wafw00f): VENDOR kimligi + gizli 200-challenge WAF tespiti. wafw00f flag ile disable edilebilir cunku saldiri payload atiyor
+#tek host'a rastgele-yol prob at, HTTP status don
 waf_probe_status(){
 	local url="$1" ua="$2" rand
 	rand="zz$(date +%s%N | tail -c 7)$RANDOM"
 	curl -s -o /dev/null -m 10 -A "$ua" -w '%{http_code}' "${url%/}/$rand" 2>/dev/null
 }
 
-#rastgele yol normalde 404/200 doner; 403/406/429/503 = WAF araya giriyor/blokluyor
+#403/406/429/503 = WAF blok
 waf_is_blocked_status(){
 	case "$1" in 403|406|429|503) return 0 ;; *) return 1 ;; esac
 }
@@ -564,6 +629,7 @@ waf_classify(){
 	: > "$OUTPUT_DIR/hosts_open"; : > "$OUTPUT_DIR/hosts_defended"
 	while IFS= read -r url; do
 		[ -z "$url" ] && continue
+		jitter
 		status=$(waf_probe_status "$url" "$ua")
 		if waf_is_blocked_status "$status"; then
 			echo "$url" >> "$OUTPUT_DIR/hosts_defended"
@@ -574,12 +640,13 @@ waf_classify(){
 	echo "[cammk] WAF on-tespiti: $(wc -l < "$OUTPUT_DIR/hosts_open" 2>/dev/null | tr -d ' ') acik, $(wc -l < "$OUTPUT_DIR/hosts_defended" 2>/dev/null | tr -d ' ') WAF/challenge (taramadan ayrildi)."
 }
 
-#tarama sonrasi canary: acik host'lar hala erisilebilir mi? bloklandiysa 'temiz' sonucu guvenilmez
+#tarama sonrasi canary: acik host hala erisilebilir mi?
 waf_canary(){
 	local ua="$1" url status
 	: > "$OUTPUT_DIR/hosts_blocked"
 	while IFS= read -r url; do
 		[ -z "$url" ] && continue
+		jitter
 		status=$(waf_probe_status "$url" "$ua")
 		waf_is_blocked_status "$status" && echo "$url" >> "$OUTPUT_DIR/hosts_blocked"
 	done < "$OUTPUT_DIR/hosts_open"
@@ -589,7 +656,7 @@ waf_canary(){
 	fi
 }
 
-#wafw00f ile WAF VENDOR kimligi + gizli WAF ayiklama (curl status-prob'un kacirdigi 200-challenge WAF'lar)
+#wafw00f: WAF vendor kimligi + gizli 200-challenge WAF'lari taramadan cikar
 waf_fingerprint(){
 	if ! command -v wafw00f >/dev/null 2>&1; then
 		echo "[cammk] wafw00f kurulu degil, WAF vendor kimligi atlaniyor."
@@ -604,7 +671,7 @@ waf_fingerprint(){
 		return 0
 	fi
 
-	# tespit edilen WAF'lar -> vendor annotasyonu (url \t firewall)
+	# tespit edilen WAF'lar (url \t firewall)
 	jq -r '.[] | select(.detected==true) | "\(.url)\t\(.firewall)"' \
 		"$OUTPUT_DIR/waf_fingerprints.json" 2>/dev/null > "$OUTPUT_DIR/waf_vendors.txt" || true
 	if [ ! -s "$OUTPUT_DIR/waf_vendors.txt" ]; then
@@ -612,8 +679,7 @@ waf_fingerprint(){
 		return 0
 	fi
 
-	# curl 'acik' dedigi ama wafw00f WAF gordugu host = GIZLI WAF (status-prob kacirdi, 200-challenge)
-	# tarama setinden cikar: hem ban riski hem guvenilmez 'temiz' sonuc onlenir
+	# curl 'acik' dedi ama wafw00f WAF gordu -> gizli WAF, taramadan cikar
 	local drop="$OUTPUT_DIR/.stealth_urls"
 	cut -f1 "$OUTPUT_DIR/waf_vendors.txt" | grep -xF -f - "$OUTPUT_DIR/hosts_open" > "$drop" 2>/dev/null || true
 	if [ -s "$drop" ]; then
@@ -629,56 +695,143 @@ waf_fingerprint(){
 	cut -f2 "$OUTPUT_DIR/waf_vendors.txt" | sort | uniq -c | sort -rn
 }
 
-#nuclei ile CWE-200 taramasi
+#Cloudflare arkasi origin IP tespiti
+run_origin(){
+	if [ ! -s "$OUTPUT_DIR/resolved_ips" ]; then
+		echo "[cammk] resolved_ips yok (once run_resolve gerekir), origin tespiti atlaniyor."
+		return 0
+	fi
+
+	# 1) hangi cozumlenen IP'ler CF edge? (origin degil)
+	: > "$OUTPUT_DIR/cf_edge_ips"; : > "$OUTPUT_DIR/non_cf_ips"
+	while IFS= read -r ip; do
+		[ -z "$ip" ] && continue
+		if is_cf_ip "$ip"; then echo "$ip" >> "$OUTPUT_DIR/cf_edge_ips"
+		else echo "$ip" >> "$OUTPUT_DIR/non_cf_ips"; fi
+	done < "$OUTPUT_DIR/resolved_ips"
+	local ncf; ncf=$(wc -l < "$OUTPUT_DIR/cf_edge_ips" 2>/dev/null | tr -d ' ')
+	echo "[cammk] CF edge tespiti: $ncf cozumlenen IP Cloudflare aralarinda (origin DEGIL, edge)."
+	if [ "$ncf" -eq 0 ]; then
+		echo "[cammk] Cloudflare arkasinda host yok gorunuyor — origin arama atlaniyor."
+		return 0
+	fi
+
+	# 2) origin adaylari: uncover (shodan/censys)
+	echo "[cammk] origin adaylari araniyor (uncover shodan,censys — keys.yaml gerekir)..."
+	nuclei -uncover -uq "ssl:\"$TARGET\"" -ue shodan,censys -uf ip -ul 100 -silent 2>/dev/null \
+		| sort -u > "$OUTPUT_DIR/origin_candidates" || true
+	# CF aralarindaki adaylari ele
+	if [ -s "$OUTPUT_DIR/origin_candidates" ]; then
+		while IFS= read -r ip; do
+			[ -z "$ip" ] && continue
+			is_cf_ip "$ip" || echo "$ip"
+		done < "$OUTPUT_DIR/origin_candidates" > "$OUTPUT_DIR/origin_candidates.f"
+		mv "$OUTPUT_DIR/origin_candidates.f" "$OUTPUT_DIR/origin_candidates"
+	fi
+	if [ ! -s "$OUTPUT_DIR/origin_candidates" ]; then
+		echo "[cammk] origin adayi bulunamadi (uncover bos veya keys yok)."
+		return 0
+	fi
+
+	# 3) dogrulama: baslik eslesirse origin say
+	: > "$OUTPUT_DIR/origin_ips"
+	local ref_title cand_title ip
+	ref_title=$(curl -s -m 10 -A "$USER_AGENT" "https://$TARGET/" 2>/dev/null | grep -oiE '<title>[^<]*' | head -1)
+	while IFS= read -r ip; do
+		[ -z "$ip" ] && continue
+		jitter
+		cand_title=$(curl -s -m 10 -k -A "$USER_AGENT" --resolve "$TARGET:443:$ip" "https://$TARGET/" 2>/dev/null | grep -oiE '<title>[^<]*' | head -1)
+		if [ -n "$cand_title" ] && [ "$cand_title" = "$ref_title" ]; then
+			echo "$ip" >> "$OUTPUT_DIR/origin_ips"
+			echo "[cammk]   origin DOGRULANDI: $ip (site basligi eslesti)"
+		fi
+	done < "$OUTPUT_DIR/origin_candidates"
+
+	if [ -s "$OUTPUT_DIR/origin_ips" ]; then
+		echo "[cammk] $(wc -l < "$OUTPUT_DIR/origin_ips" | tr -d ' ') dogrulanmis origin IP -> origin_ips."
+		if [ "$CF_BYPASS" = true ]; then
+			echo "[!] origin IP'ler nuclei hedeflerine EKLENECEK (varsayilan) — KAPSAM DISI olabilir, ROE'yi dogrula! (kapatmak: --skip-cf-bypass)"
+		else
+			echo "[cammk] (not) --skip-cf-bypass verildi; origin IP'ler yalnizca raporlandi, taramaya dahil edilmedi."
+		fi
+	else
+		echo "[cammk] dogrulanmis origin bulunamadi (adaylar hedef basligiyla eslesmedi)."
+	fi
+}
+
+#ortak nuclei taramasi (domain + origin ayni flaglari paylasir)
+nuclei_200(){
+	local list="$1" out="$2" jout="$3"; shift 3
+	nuclei -l "$list" \
+		-t "$SCRIPT_DIR/nuclei_templates/" \
+		-severity low,medium,high,critical \
+		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
+		-retries 2 -timeout 10 -mhe 30 \
+		-H "User-Agent: $USER_AGENT" \
+		-tlsi -hpd -shp \
+		-stats -si 30 \
+		-o "$out" -je "$jout" \
+		"$@" || true
+}
+
+#nuclei ile CWE-200 (sensitive info exposure) taramasi — WAF korumali
+#not: template deposu kurulu olmali; ilk kullanimdan once bir kez: nuclei -ut
 run_nuclei(){
 	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
 		echo "[cammk] canli host yok, nuclei taramasi atlaniyor."
 		return 0
 	fi
 
-	# WAF korumasi: varsayilan random-agent yerine sabit/gercekci tarayici UA
-	local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+	# bu calismanin UA'si
+	local ua="$USER_AGENT"
 
-	# WAF on-tespiti (curl, benign): anlik challenge/blok donen host'lari taramadan ayir
+	# WAF on-tespiti: challenge donen host'lari ayir
 	waf_classify "$ua"
-	# WAF vendor kimligi (wafw00f, opt-in): curl'un kacirdigi gizli 200-challenge WAF'lari da ayikla
+	# wafw00f: gizli WAF'lari ayikla
 	if [ "$SKIP_WAFW00F" != true ]; then
 		waf_fingerprint
 	else
 		echo "[cammk] (atlandi) wafw00f vendor kimligi — SKIP_WAFW00F=true"
 	fi
 	if [ ! -s "$OUTPUT_DIR/hosts_open" ]; then
-		echo "[!] taranabilir 'acik' host yok, ip ban veya tamami waflandi, nuclei atlaniyor."
+		echo "[!] taranabilir 'acik' host yok — hepsi WAF korumali. Muhtemel IP ban veya tam WAF kapsami; nuclei atlaniyor."
 		return 0
 	fi
 
-	# template check
+
 	if [ ! -d "$SCRIPT_DIR/nuclei_templates" ] || [ -z "$(ls -A "$SCRIPT_DIR/nuclei_templates" 2>/dev/null)" ]; then
 		echo "[cammk] nuclei_templates/ bos veya yok — taranacak custom template yok, nuclei atlaniyor."
 		return 0
 	fi
-	local -a tmpl=(-t "$SCRIPT_DIR/nuclei_templates/")
-	
-	echo "[cammk] nuclei exposure/CWE-200 taramasi baslatiliyor..."
-	nuclei -l "$OUTPUT_DIR/hosts_open" \
-		"${tmpl[@]}" \
-		-severity low,medium,high,critical \
-		-ss host-spray -rl 5 -c 25 -bs 25 \
-		-retries 2 -timeout 10 -mhe 30 \
-		-H "User-Agent: $ua" \
-		-hpd -shp \
-		-stats -si 30 \
-		-o "$OUTPUT_DIR/nuclei_exposures.txt" \
-		-je "$OUTPUT_DIR/nuclei_exposures.json" || true
+	echo "[cammk] nuclei exposure/CWE-200 taramasi baslatiliyor (WAF korumali)..."
 
+	# 1) domain taramasi
+	nuclei_200 "$OUTPUT_DIR/hosts_open" \
+		"$OUTPUT_DIR/nuclei_exposures.txt" "$OUTPUT_DIR/nuclei_exposures.json"
 	if [ -s "$OUTPUT_DIR/nuclei_exposures.txt" ]; then
-		echo "[cammk] nuclei tamamlandi. $(wc -l < "$OUTPUT_DIR/nuclei_exposures.txt") bulgu nuclei_exposures.txt dosyasina kaydedildi."
+		echo "[cammk] nuclei (domain) tamamlandi. $(wc -l < "$OUTPUT_DIR/nuclei_exposures.txt") bulgu -> nuclei_exposures.txt."
 	else
-		echo "[cammk] nuclei bulgu uretmedi."
+		echo "[cammk] nuclei (domain) bulgu uretmedi."
 		rm -f "$OUTPUT_DIR/nuclei_exposures.txt"
 	fi
 
-	# tarama sonrasi canary: acik host'lar tarama boyunca bloklandi mi? (temiz sonuc guvenilir mi?)
+	# 2) ORIGIN taramasi, origin IP'yi tara.
+	if [ "$CF_BYPASS" = true ] && [ -s "$OUTPUT_DIR/origin_ips" ]; then
+		local origin_urls="$OUTPUT_DIR/origin_urls"
+		sed 's#^#https://#' "$OUTPUT_DIR/origin_ips" | sort -u > "$origin_urls"
+		echo "[!] $(wc -l < "$OUTPUT_DIR/origin_ips" | tr -d ' ') origin IP taraniyor (Host/SNI=$TARGET, CDN atlaniyor) — KAPSAM DISI riski (kapatmak: --skip-cf-bypass)."
+		nuclei_200 "$origin_urls" \
+			"$OUTPUT_DIR/nuclei_origin_exposures.txt" "$OUTPUT_DIR/nuclei_origin_exposures.json" \
+			-H "Host: $TARGET" -sni "$TARGET"
+		if [ -s "$OUTPUT_DIR/nuclei_origin_exposures.txt" ]; then
+			echo "[!] nuclei (origin) $(wc -l < "$OUTPUT_DIR/nuclei_origin_exposures.txt" | tr -d ' ') bulgu -> nuclei_origin_exposures.txt (CDN-bypass yolu)."
+		else
+			echo "[cammk] nuclei (origin) bulgu uretmedi."
+			rm -f "$OUTPUT_DIR/nuclei_origin_exposures.txt"
+		fi
+	fi
+
+	# tarama sonrasi canary
 	waf_canary "$ua"
 }
 
@@ -717,9 +870,20 @@ main(){
 	run_step SKIP_KATANA_JS   run_katana_js
 	run_step SKIP_FUZZ        run_fuzz
 	run_step SKIP_DEDUPE      run_dedupe
+	run_step SKIP_ORIGIN      run_origin
 	run_step SKIP_NUCLEI      run_nuclei
 
 	echo "[cammk] pipeline tamamlandi."
 }
+
+
+
+#//"-tags tech"
+#//waf detection template
+#//latency jitter
+#//ua randomize
+#//find host ip behind cf
+#//bypass cf if possible
+
 
 main "$@"
