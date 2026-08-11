@@ -45,12 +45,12 @@ http:
         - "rar"
         - "7z"
         - "sql.gz"
-    stop-at-first-match: true   # one confirmed backup per host is enough
-    max-size: 500               # only read the first 500 bytes; magic bytes live at the start
+    stop-at-first-match: true
+    max-size: 500
 
     matchers-condition: and
     matchers:
-      - type: binary            # prove it is really an archive (this IS the anti-soft-404 guard)
+      - type: binary            # prove it is really an archive
         part: body
         condition: or
         binary:
