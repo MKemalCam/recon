@@ -66,7 +66,7 @@ Argumanlar:
   -h, --help           Bu yardimi goster
   --naabu-ports <m>    naabu port kapsami: common (varsayilan) | all
                        common = ortak HTTP/panel portlari, all = 1-65535
-  --rate <n>           tum aktif araclarda saniyede istek siniri (varsayilan 5; ban riskine karsi dusur, or. 2)
+  --rate <n>           tum aktif araclarda saniyede istek siniri (default 5)
 
 Adim atlama flaglari:
   --skip-keys          api key setup
@@ -602,7 +602,7 @@ run_dedupe(){
 		return 0
 	fi
 	echo "[cammk] $(wc -l < "$OUTPUT_DIR/all_urls") url httpx ile dogrulaniyor (dedupe + fp/404)..."
-	cat "$OUTPUT_DIR/all_urls" | httpx-toolkit -silent -status-code -title -o "$OUTPUT_DIR/all_live_urls"
+	cat "$OUTPUT_DIR/all_urls" | httpx-toolkit -silent -status-code -rl "$RATE" -title -o "$OUTPUT_DIR/all_live_urls"
 	[ -s "$OUTPUT_DIR/all_live_urls" ] && echo "[cammk] dedupe tamamlandi. $(wc -l < "$OUTPUT_DIR/all_live_urls") canli url all_live_urls dosyasina kaydedildi." || echo "[cammk] canli url bulunamadi."
 }
 
@@ -774,7 +774,7 @@ nuclei_200(){
 		"$@" || true
 }
 
-#nuclei ile CWE-200 (sensitive info exposure) taramasi — WAF korumali
+#nuclei ile CWE-200 (sensitive info exposure) taramasi
 #not: template deposu kurulu olmali; ilk kullanimdan once bir kez: nuclei -ut
 run_nuclei(){
 	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
@@ -884,6 +884,4 @@ main(){
 #//ua randomize
 #//find host ip behind cf
 #//bypass cf if possible
-
-
 main "$@"
