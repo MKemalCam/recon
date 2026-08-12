@@ -6,18 +6,25 @@ info:
   severity: medium
   description: |
     Detects domain-named or generic compressed backups exposed inside common backup
-    subdirectories (/backup, /backups, /old, /files, /download). Complements the stock
-    zip-backup-files template, which only enumerates the web root. Confirmed via archive
-    magic bytes, so an HTML soft-404 page cannot produce a false positive.
+    subdirectories (/backup, /backups, /bak, /old, /files, /download, /dump, /db,
+    /database, /archive, /archives, /sql). Complements the stock zip-backup-files
+    template, which only enumerates the web root. Covers zip, gzip, bzip2, xz, rar,
+    7-zip and POSIX tar containers (including the tar.gz/tgz, tar.bz2/tbz2,
+    tar.xz/txz and sql.gz variants). Every hit is confirmed via archive magic bytes,
+    so an HTML soft-404 page cannot produce a false positive.
   reference:
     - https://cwe.mitre.org/data/definitions/200.html
+    - https://cwe.mitre.org/data/definitions/530.html
   classification:
     cvss-metrics: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N
     cvss-score: 5.3
     cwe-id: CWE-200
+  remediation: |
+    Remove backup archives from web-served directories. Store backups outside the
+    web root, restrict access, and add deny rules for archive extensions.
   metadata:
-    max-request: 180
-  tags: exposure,backup,cwe200
+    max-request: 1680
+  tags: exposure,backup,cwe200,files
 
 http:
   - method: GET
@@ -28,25 +35,44 @@ http:
       DIR:
         - "backup"
         - "backups"
+        - "bak"
         - "old"
         - "files"
         - "download"
+        - "dump"
+        - "db"
+        - "database"
+        - "archive"
+        - "archives"
+        - "sql"
       FILE:
-        - "{{RDN}}"      # example.com
-        - "{{SD}}"       # www (subdomain label)
+        - "{{RDN}}"      # example.com  (root domain name)
+        - "{{SD}}"       # www          (subdomain label)
         - "backup"
         - "www"
         - "db"
+        - "database"
         - "site"
+        - "app"
+        - "dump"
+        - "data"
       EXT:
         - "zip"
         - "tar"
         - "tar.gz"
+        - "tgz"
+        - "tar.bz2"
+        - "tbz2"
+        - "tar.xz"
+        - "txz"
         - "rar"
         - "7z"
+        - "gz"
+        - "bz2"
+        - "xz"
         - "sql.gz"
-    stop-at-first-match: true
-    max-size: 500
+    stop-at-first-match: true   # one confirmed backup per host is enough
+    max-size: 500               # only read the first 500 bytes
 
     matchers-condition: and
     matchers:
@@ -54,11 +80,14 @@ http:
         part: body
         condition: or
         binary:
-          - "504B0304"          # PK.. -> zip
-          - "1f8b"              # -> gzip (tar.gz, sql.gz)
-          - "526172211A0700"    # Rar! -> rar
+          - "504B0304"          # PK.. -> zip (also war/jar/odt/xlsx families)
+          - "1f8b"              # -> gzip (gz, tgz, tar.gz, sql.gz)
+          - "425A68"            # BZh  -> bzip2 (bz2, tbz2, tar.bz2)
+          - "FD377A585A00"      # .7zXZ magic -> xz (xz, txz, tar.xz)
+          - "526172211A0700"    # Rar! -> rar (v1.5-4.x)
+          - "526172211A070100"  # Rar! -> rar (v5.0+)
           - "377ABCAF271C"      # 7z\xBC\xAF'.  -> 7-Zip
-          - "7573746172"        # ustar -> tar (POSIX magic at offset 257)
+          - "7573746172"        # ustar -> tar (POSIX magic at offset 257, within max-size)
       - type: status
         status:
           - 200
