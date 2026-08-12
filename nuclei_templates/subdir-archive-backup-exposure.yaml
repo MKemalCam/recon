@@ -71,6 +71,7 @@ http:
         - "bz2"
         - "xz"
         - "sql.gz"
+        - "sql"
     stop-at-first-match: true   # one confirmed backup per host is enough
     max-size: 500               # only read the first 500 bytes
 
