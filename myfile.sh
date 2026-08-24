@@ -96,7 +96,7 @@ Adim atlama flaglari:
   --skip-nuclei        nuclei ile exposure/CWE-200 taramasi (WAF korumali)
   --skip-wafw00f       wafw00f WAF vendor kimligi + gizli WAF tespiti (nuclei icinde)
   --skip-origin        Cloudflare arkasi origin IP tespiti (aktif recon sonu)
-  --skip-cf-bypass     dogrulanmis origin IP'leri nuclei hedeflerine EKLEME (varsayilan: ekli — KAPSAM DISI riski!)
+  --skip-cf-bypass     dogrulanmis origin IP'leri nuclei hedeflerine ekleme (default: ekli)
   --no-jitter          istekler arasi rastgele gecikmeyi kapat
 
 Ornek:
