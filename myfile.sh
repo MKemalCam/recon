@@ -22,12 +22,14 @@ SKIP_KATANA=false
 SKIP_KATANA_JS=false
 SKIP_FUZZ=false
 SKIP_DEDUPE=false
+SKIP_TAKEOVER=false
 SKIP_NUCLEI=false
 SKIP_WAFW00F=false
 SKIP_ORIGIN=false
 CF_BYPASS=true
 JITTER=true
 RATE=5          # saniyede istek siniri (--rate)
+PROXY=""        # --proxy: nuclei+katana trafigini proxy'ye yonlendir (Burp/tunnel; bos=kapali)
 
 TARGET=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +69,9 @@ Argumanlar:
   --naabu-ports <m>    naabu port kapsami: common (varsayilan) | all
                        common = ortak HTTP/panel portlari, all = 1-65535
   --rate <n>           tum aktif araclarda saniyede istek siniri (default 5)
+  --proxy [url]        nuclei + katana trafigini proxy'ye yonlendir (Burp, SSH-tunnel vs.)
+                       varsayilan http://127.0.0.1:8080; ozel: --proxy socks5://host:port
+                       (masscan/naabu/nmap/dnsx proxy'lenmez — ham paket/DNS, IP sizar)
 
 Adim atlama flaglari:
   --skip-keys          api key setup
@@ -87,6 +92,7 @@ Adim atlama flaglari:
   --skip-katana-js     katana js dosyalarini indir + trufflehog
   --skip-fuzz          ffuf ile dizin/dosya fuzzing
   --skip-dedupe        tum url'leri birlestir + httpx 404/fp ayikla
+  --skip-takeover      subzy ile subdomain takeover (dangling CNAME) tespiti
   --skip-nuclei        nuclei ile exposure/CWE-200 taramasi (WAF korumali)
   --skip-wafw00f       wafw00f WAF vendor kimligi + gizli WAF tespiti (nuclei icinde)
   --skip-origin        Cloudflare arkasi origin IP tespiti (aktif recon sonu)
@@ -96,7 +102,16 @@ Adim atlama flaglari:
 Ornek:
   $0 -d testfire.net --skip-gau --skip-github
   $0 testfire.net --skip-keys --skip-subfinder --skip-gau
+  $0 -d testfire.net --proxy   # nuclei+katana proxy'ye (127.0.0.1:8080 = Burp)
 EOF
+}
+
+#--proxy url dogrula+normalize: sema yoksa http:// ekle, host:port zorunlu
+normalize_proxy(){
+	local p="$1"
+	[[ "$p" =~ ^(https?|socks5):// ]] || p="http://$p"
+	[[ "$p" =~ ^(https?|socks5)://[A-Za-z0-9._-]+:[0-9]+$ ]] && { echo "$p"; return 0; }
+	return 1
 }
 
 parse_args(){
@@ -112,6 +127,14 @@ parse_args(){
 			--rate)
 				if [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "${2:-0}" -ge 1 ]; then RATE="$2"; shift 2
 				else echo "[!] --rate pozitif tam sayi ister (or. --rate 2)"; exit 1; fi ;;
+			--proxy)
+				# opsiyonel proxy url; verilmezse varsayilan (127.0.0.1:8080 = Burp)
+				if [[ -n "${2:-}" && "$2" != -* ]]; then
+					if PROXY=$(normalize_proxy "$2"); then shift 2
+					else echo "[!] --proxy gecersiz adres: $2 (or. http://127.0.0.1:8080 | socks5://host:port)"; exit 1; fi
+				else
+					PROXY="http://127.0.0.1:8080"; shift
+				fi ;;
 			--skip-keys)        SKIP_KEYS=true;        shift ;;
 			--skip-subfinder)   SKIP_SUBFINDER=true;   shift ;;
 			--skip-gau)         SKIP_GAU=true;         shift ;;
@@ -130,6 +153,7 @@ parse_args(){
 			--skip-katana-js)   SKIP_KATANA_JS=true;   shift ;;
 			--skip-fuzz)        SKIP_FUZZ=true;        shift ;;
 			--skip-dedupe)      SKIP_DEDUPE=true;      shift ;;
+			--skip-takeover)    SKIP_TAKEOVER=true;    shift ;;
 			--skip-nuclei)      SKIP_NUCLEI=true;      shift ;;
 			--skip-wafw00f)     SKIP_WAFW00F=true;     shift ;;
 			--skip-origin)      SKIP_ORIGIN=true;      shift ;;
@@ -168,7 +192,7 @@ setup_output(){
 
 check_deps(){
 	local missing=0
-	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog whatweb katana ffuf nuclei wafw00f curl jq; do
+	for tool in subfinder gau httpx-toolkit dnsx masscan naabu nmap trufflehog whatweb katana ffuf nuclei wafw00f subzy curl jq; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "[!] eksik arac: $tool"
 			missing=1
@@ -533,7 +557,9 @@ run_katana(){
 		return 0
 	fi
 	echo "[cammk] katana ile crawl yapiliyor..."
-	katana -list "$OUTPUT_DIR/live_subdomains" -jc -kf all -d 3 -c 3 -rl "$RATE" -silent -o "$OUTPUT_DIR/katana_urls"
+	# [cammk] --proxy: crawl trafigini proxy'ye yonlendir (Burp sitemap tohumla)
+	local proxy=(); [ -n "$PROXY" ] && { proxy=(-proxy "$PROXY"); echo "[cammk] katana -> proxy: $PROXY"; }
+	katana -list "$OUTPUT_DIR/live_subdomains" -jc -kf all -d 3 -c 3 -rl "$RATE" "${proxy[@]}" -silent -o "$OUTPUT_DIR/katana_urls"
 	[ -s "$OUTPUT_DIR/katana_urls" ] && echo "[cammk] katana tamamlandi. $(wc -l < "$OUTPUT_DIR/katana_urls") url katana_urls dosyasina kaydedildi." || echo "[!] katana url uretmedi."
 }
 
@@ -609,6 +635,34 @@ run_dedupe(){
 ############################################
 ###               VULN SCAN              ###
 ############################################
+
+#subzy ile subdomain takeover: dangling CNAME -> claim edilebilir 3.parti servis
+run_takeover(){
+	if ! command -v subzy >/dev/null 2>&1; then
+		echo "[cammk] subzy kurulu degil, takeover tespiti atlaniyor."
+		return 0
+	fi
+	if [ ! -s "$OUTPUT_DIR/subdomains_list" ]; then
+		echo "[cammk] subdomains_list yok/bos, takeover tespiti atlaniyor."
+		return 0
+	fi
+	echo "[cammk] subzy ile subdomain takeover taramasi ($(wc -l < "$OUTPUT_DIR/subdomains_list" | tr -d ' ') subdomain)..."
+	# --vuln: sadece zafiyetli olanlari yaz, --hide_fails: konsol gurultusu az
+	# --concurrency=RATE: subzy'de rl yok, global --rate'i concurrency ile throttle et
+	subzy run --targets "$OUTPUT_DIR/subdomains_list" \
+		--output "$OUTPUT_DIR/takeover_results.json" \
+		--concurrency "$RATE" --timeout 10 \
+		--vuln --hide_fails || true
+	# subzy bos sonucta [] yazabilir -> jq ile gercek bulgu say
+	local nvuln; nvuln=$(jq 'length' "$OUTPUT_DIR/takeover_results.json" 2>/dev/null || echo 0)
+	[ -z "$nvuln" ] && nvuln=0
+	if [ "$nvuln" -gt 0 ]; then
+		echo "[!] $nvuln subdomain takeover ADAYI -> takeover_results.json (manuel claim ile DOGRULA)."
+	else
+		echo "[cammk] takeover adayi bulunamadi."
+		rm -f "$OUTPUT_DIR/takeover_results.json"
+	fi
+}
 
 #--- WAF farkindalik yardimcilari ---
 #tek host'a rastgele-yol prob at, HTTP status don
@@ -759,23 +813,72 @@ run_origin(){
 	fi
 }
 
-#ortak nuclei taramasi (domain + origin ayni flaglari paylasir)
 nuclei_200(){
 	local list="$1" out="$2" jout="$3"; shift 3
+	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
 	nuclei -l "$list" \
-		-t "$SCRIPT_DIR/nuclei_templates/" \
+		-t "$SCRIPT_DIR/nuclei_templates/cwe200/" \
 		-severity low,medium,high,critical \
 		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
 		-retries 2 -timeout 10 -mhe 30 \
 		-H "User-Agent: $USER_AGENT" \
 		-tlsi -hpd -shp \
 		-stats -si 30 \
+		"${proxy[@]}" \
 		-o "$out" -je "$jout" \
 		"$@" || true
 }
 
-#nuclei ile CWE-200 (sensitive info exposure) taramasi
-#not: template deposu kurulu olmali; ilk kullanimdan once bir kez: nuclei -ut
+
+nuclei_headers(){
+	local list="$1" out="$2" jout="$3"; shift 3
+	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
+	nuclei -l "$list" \
+		-t "$SCRIPT_DIR/nuclei_templates/headers/" \
+		-severity info,low,medium,high,critical \
+		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
+		-retries 2 -timeout 10 -mhe 30 \
+		-H "User-Agent: $USER_AGENT" \
+		-tlsi -hpd -shp \
+		-stats -si 30 \
+		"${proxy[@]}" \
+		-o "$out" -je "$jout" \
+		"$@" || true
+}
+
+nuclei_sqli(){
+	local list="$1" out="$2" jout="$3"; shift 3
+	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
+	nuclei -l "$list" \
+		-t "$SCRIPT_DIR/nuclei_templates/sqli/" \
+		-severity info,low,medium,high,critical \
+		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
+		-retries 2 -timeout 10 -mhe 30 \
+		-H "User-Agent: $USER_AGENT" \
+		-tlsi -hpd -shp \
+		-stats -si 30 \
+		"${proxy[@]}" \
+		-o "$out" -je "$jout" \
+		"$@" || true
+}
+
+nuclei_xss(){
+	local list="$1" out="$2" jout="$3"; shift 3
+	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
+	nuclei -l "$list" \
+		-t "$SCRIPT_DIR/nuclei_templates/xss/" \
+		-severity info,low,medium,high,critical \
+		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
+		-retries 2 -timeout 10 -mhe 30 \
+		-H "User-Agent: $USER_AGENT" \
+		-tlsi -hpd -shp \
+		-stats -si 30 \
+		"${proxy[@]}" \
+		-o "$out" -je "$jout" \
+		"$@" || true
+}
+
+#nucleilari calistir
 run_nuclei(){
 	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
 		echo "[cammk] canli host yok, nuclei taramasi atlaniyor."
@@ -804,6 +907,7 @@ run_nuclei(){
 		return 0
 	fi
 	echo "[cammk] nuclei exposure/CWE-200 taramasi baslatiliyor (WAF korumali)..."
+	[ -n "$PROXY" ] && echo "[cammk] nuclei -> proxy: $PROXY (proxy dinliyor olmali)"
 
 	# 1) domain taramasi
 	nuclei_200 "$OUTPUT_DIR/hosts_open" \
@@ -815,7 +919,37 @@ run_nuclei(){
 		rm -f "$OUTPUT_DIR/nuclei_exposures.txt"
 	fi
 
-	# 2) ORIGIN taramasi, origin IP'yi tara.
+	# 1b) header/CORS taramasi
+	nuclei_headers "$OUTPUT_DIR/hosts_open" \
+		"$OUTPUT_DIR/nuclei_headers.txt" "$OUTPUT_DIR/nuclei_headers.json"
+	if [ -s "$OUTPUT_DIR/nuclei_headers.txt" ]; then
+		echo "[cammk] nuclei header/CORS: $(wc -l < "$OUTPUT_DIR/nuclei_headers.txt") bulgu -> nuclei_headers.txt (cogu info/hijyen; CORS matcher'a bak)."
+	else
+		echo "[cammk] nuclei header/CORS bulgu uretmedi."
+		rm -f "$OUTPUT_DIR/nuclei_headers.txt"
+	fi
+
+	# 1c) sqli taramasi
+	nuclei_sqli "$OUTPUT_DIR/hosts_open" \
+		"$OUTPUT_DIR/nuclei_sqli.txt" "$OUTPUT_DIR/nuclei_sqli.json"
+	if [ -s "$OUTPUT_DIR/nuclei_sqli.txt" ]; then
+		echo "[cammk] nuclei sqli: $(wc -l < "$OUTPUT_DIR/nuclei_sqli.txt") bulgu -> nuclei_sqli.txt"
+	else
+		echo "[cammk] nuclei sqli bulgu uretmedi."
+		rm -f "$OUTPUT_DIR/nuclei_sqli.txt"
+	fi
+
+	# 1d) xss taramasi
+	nuclei_xss "$OUTPUT_DIR/hosts_open" \
+		"$OUTPUT_DIR/nuclei_xss.txt" "$OUTPUT_DIR/nuclei_xss.json"
+	if [ -s "$OUTPUT_DIR/nuclei_xss.txt" ]; then
+		echo "[cammk] nuclei xss: $(wc -l < "$OUTPUT_DIR/nuclei_xss.txt") bulgu -> nuclei_xss.txt"
+	else
+		echo "[cammk] nuclei xss bulgu uretmedi."
+		rm -f "$OUTPUT_DIR/nuclei_xss.txt"
+	fi
+	
+	# 2) origin IP'yi tara.
 	if [ "$CF_BYPASS" = true ] && [ -s "$OUTPUT_DIR/origin_ips" ]; then
 		local origin_urls="$OUTPUT_DIR/origin_urls"
 		sed 's#^#https://#' "$OUTPUT_DIR/origin_ips" | sort -u > "$origin_urls"
@@ -870,6 +1004,7 @@ main(){
 	run_step SKIP_KATANA_JS   run_katana_js
 	run_step SKIP_FUZZ        run_fuzz
 	run_step SKIP_DEDUPE      run_dedupe
+	run_step SKIP_TAKEOVER    run_takeover
 	run_step SKIP_ORIGIN      run_origin
 	run_step SKIP_NUCLEI      run_nuclei
 
