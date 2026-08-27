@@ -96,7 +96,7 @@ Adim atlama flaglari:
   --skip-nuclei        nuclei ile exposure/CWE-200 taramasi (WAF korumali)
   --skip-wafw00f       wafw00f WAF vendor kimligi + gizli WAF tespiti (nuclei icinde)
   --skip-origin        Cloudflare arkasi origin IP tespiti (aktif recon sonu)
-  --skip-cf-bypass     dogrulanmis origin IP'leri nuclei hedeflerine ekleme (default: ekli)
+  --skip-cf-bypass     dogrulanmis origin IP'leri nuclei hedeflerine EKLEME (varsayilan: ekli — KAPSAM DISI riski!)
   --no-jitter          istekler arasi rastgele gecikmeyi kapat
 
 Ornek:
@@ -647,8 +647,6 @@ run_takeover(){
 		return 0
 	fi
 	echo "[cammk] subzy ile subdomain takeover taramasi ($(wc -l < "$OUTPUT_DIR/subdomains_list" | tr -d ' ') subdomain)..."
-	# --vuln: sadece zafiyetli olanlari yaz, --hide_fails: konsol gurultusu az
-	# --concurrency=RATE: subzy'de rl yok, global --rate'i concurrency ile throttle et
 	subzy run --targets "$OUTPUT_DIR/subdomains_list" \
 		--output "$OUTPUT_DIR/takeover_results.json" \
 		--concurrency "$RATE" --timeout 10 \
@@ -813,6 +811,7 @@ run_origin(){
 	fi
 }
 
+#ortak nuclei taramasi (domain + origin ayni flaglari paylasir)
 nuclei_200(){
 	local list="$1" out="$2" jout="$3"; shift 3
 	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
@@ -829,7 +828,7 @@ nuclei_200(){
 		"$@" || true
 }
 
-
+#header/CORS taramasi (headers/ klasoru; info dahil; ayri output — CWE-200 bulgularini kirletmez)
 nuclei_headers(){
 	local list="$1" out="$2" jout="$3"; shift 3
 	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
@@ -851,6 +850,7 @@ nuclei_sqli(){
 	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
 	nuclei -l "$list" \
 		-t "$SCRIPT_DIR/nuclei_templates/sqli/" \
+		-dast \
 		-severity info,low,medium,high,critical \
 		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
 		-retries 2 -timeout 10 -mhe 30 \
@@ -867,6 +867,7 @@ nuclei_xss(){
 	local proxy=(); [ -n "$PROXY" ] && proxy=(-p "$PROXY")   # [cammk] --proxy: nuclei -> proxy
 	nuclei -l "$list" \
 		-t "$SCRIPT_DIR/nuclei_templates/xss/" \
+		-dast \
 		-severity info,low,medium,high,critical \
 		-ss host-spray -rl "$RATE" -c 10 -bs 10 \
 		-retries 2 -timeout 10 -mhe 30 \
@@ -878,7 +879,7 @@ nuclei_xss(){
 		"$@" || true
 }
 
-#nucleilari calistir
+#nuclei ile CWE-200 (sensitive info exposure) taramasi
 run_nuclei(){
 	if [ ! -s "$OUTPUT_DIR/live_subdomains" ]; then
 		echo "[cammk] canli host yok, nuclei taramasi atlaniyor."
@@ -919,7 +920,7 @@ run_nuclei(){
 		rm -f "$OUTPUT_DIR/nuclei_exposures.txt"
 	fi
 
-	# 1b) header/CORS taramasi
+	# 1b) header/CORS taramasi (headers/ klasoru; ayri output dosyasi)
 	nuclei_headers "$OUTPUT_DIR/hosts_open" \
 		"$OUTPUT_DIR/nuclei_headers.txt" "$OUTPUT_DIR/nuclei_headers.json"
 	if [ -s "$OUTPUT_DIR/nuclei_headers.txt" ]; then
@@ -929,27 +930,39 @@ run_nuclei(){
 		rm -f "$OUTPUT_DIR/nuclei_headers.txt"
 	fi
 
-	# 1c) sqli taramasi
-	nuclei_sqli "$OUTPUT_DIR/hosts_open" \
-		"$OUTPUT_DIR/nuclei_sqli.txt" "$OUTPUT_DIR/nuclei_sqli.json"
-	if [ -s "$OUTPUT_DIR/nuclei_sqli.txt" ]; then
-		echo "[cammk] nuclei sqli: $(wc -l < "$OUTPUT_DIR/nuclei_sqli.txt") bulgu -> nuclei_sqli.txt"
-	else
-		echo "[cammk] nuclei sqli bulgu uretmedi."
-		rm -f "$OUTPUT_DIR/nuclei_sqli.txt"
+	# --- DAST (XSS/SQLi): parametreli url gerekir (fuzzing query/body param'a enjekte eder) ---
+	cat "$OUTPUT_DIR/all_urls" "$OUTPUT_DIR/katana_urls" "$OUTPUT_DIR/gau_filtered" 2>/dev/null \
+		| grep -aE '\?[^ ?=]+=' | sort -u > "$OUTPUT_DIR/param_urls"
+	if command -v uro >/dev/null 2>&1 && [ -s "$OUTPUT_DIR/param_urls" ]; then
+		uro -i "$OUTPUT_DIR/param_urls" 2>/dev/null | sort -u > "$OUTPUT_DIR/param_urls.uro" \
+			&& mv "$OUTPUT_DIR/param_urls.uro" "$OUTPUT_DIR/param_urls"
 	fi
 
-	# 1d) xss taramasi
-	nuclei_xss "$OUTPUT_DIR/hosts_open" \
-		"$OUTPUT_DIR/nuclei_xss.txt" "$OUTPUT_DIR/nuclei_xss.json"
-	if [ -s "$OUTPUT_DIR/nuclei_xss.txt" ]; then
-		echo "[cammk] nuclei xss: $(wc -l < "$OUTPUT_DIR/nuclei_xss.txt") bulgu -> nuclei_xss.txt"
+	if [ ! -s "$OUTPUT_DIR/param_urls" ]; then
+		echo "[cammk] parametreli url yok (katana/gau ?param= bulamadi) — XSS/SQLi DAST atlaniyor."
 	else
-		echo "[cammk] nuclei xss bulgu uretmedi."
-		rm -f "$OUTPUT_DIR/nuclei_xss.txt"
+		echo "[cammk] DAST hedefi: $(wc -l < "$OUTPUT_DIR/param_urls" | tr -d ' ') parametreli url (param_urls)."
+
+		nuclei_sqli "$OUTPUT_DIR/param_urls" \
+			"$OUTPUT_DIR/nuclei_sqli.txt" "$OUTPUT_DIR/nuclei_sqli.json"
+		if [ -s "$OUTPUT_DIR/nuclei_sqli.txt" ]; then
+			echo "[cammk] nuclei sqli: $(wc -l < "$OUTPUT_DIR/nuclei_sqli.txt") bulgu -> nuclei_sqli.txt"
+		else
+			echo "[cammk] nuclei sqli bulgu uretmedi."
+			rm -f "$OUTPUT_DIR/nuclei_sqli.txt"
+		fi
+
+		nuclei_xss "$OUTPUT_DIR/param_urls" \
+			"$OUTPUT_DIR/nuclei_xss.txt" "$OUTPUT_DIR/nuclei_xss.json"
+		if [ -s "$OUTPUT_DIR/nuclei_xss.txt" ]; then
+			echo "[cammk] nuclei xss: $(wc -l < "$OUTPUT_DIR/nuclei_xss.txt") bulgu -> nuclei_xss.txt"
+		else
+			echo "[cammk] nuclei xss bulgu uretmedi."
+			rm -f "$OUTPUT_DIR/nuclei_xss.txt"
+		fi
 	fi
 	
-	# 2) origin IP'yi tara.
+	# 2) ORIGIN taramasi, origin IP'yi tara.
 	if [ "$CF_BYPASS" = true ] && [ -s "$OUTPUT_DIR/origin_ips" ]; then
 		local origin_urls="$OUTPUT_DIR/origin_urls"
 		sed 's#^#https://#' "$OUTPUT_DIR/origin_ips" | sort -u > "$origin_urls"
