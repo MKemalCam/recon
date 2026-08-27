@@ -184,6 +184,11 @@ setup_output(){
 	OUTPUT_DIR="cammk_${SAFE_TARGET}"
 	mkdir -p "$OUTPUT_DIR"
 
+	# [cammk] tum calismayi (stdout+stderr) bastan sona hem ekrana hem log dosyasina yaz
+	LOG_FILE="$OUTPUT_DIR/run_$(date +%Y%m%d_%H%M%S).log"
+	exec > >(tee -a "$LOG_FILE") 2>&1
+	echo "[cammk] tam calisma logu: $LOG_FILE"
+
 	# bu calisma icin rastgele UA sec
 	USER_AGENT="${UA_POOL[$((RANDOM % ${#UA_POOL[@]}))]}"
 	echo "[cammk] bu calisma icin User-Agent: $USER_AGENT"
@@ -930,7 +935,7 @@ run_nuclei(){
 		rm -f "$OUTPUT_DIR/nuclei_headers.txt"
 	fi
 
-	# --- DAST (XSS/SQLi): parametreli url gerekir (fuzzing query/body param'a enjekte eder) ---
+	# --- DAST (XSS/SQLi)---
 	cat "$OUTPUT_DIR/all_urls" "$OUTPUT_DIR/katana_urls" "$OUTPUT_DIR/gau_filtered" 2>/dev/null \
 		| grep -aE '\?[^ ?=]+=' | sort -u > "$OUTPUT_DIR/param_urls"
 	if command -v uro >/dev/null 2>&1 && [ -s "$OUTPUT_DIR/param_urls" ]; then
